@@ -28,6 +28,323 @@ let memoryUpdateQueue = Promise.resolve();
 
 class ContextExceededError extends Error {}
 
+const VEX_API_SURFACE = Object.freeze({
+    "channels.create": {
+        args: ["name", "serverID"],
+        confirm: true,
+        description: "Create a channel in a server.",
+    },
+    "channels.delete": {
+        args: ["channelID"],
+        confirm: true,
+        description: "Delete a channel.",
+    },
+    "channels.retrieve": {
+        args: ["serverID"],
+        description: "List channels in a server.",
+    },
+    "channels.retrieveByID": {
+        args: ["channelID"],
+        description: "Get one channel by ID.",
+    },
+    "channels.userList": {
+        args: ["channelID"],
+        description: "List users visible in a channel.",
+    },
+    "devices.abortPendingRegistration": {
+        args: ["{challenge,requestID}"],
+        confirm: true,
+        description: "Abort an unpublished pending device enrollment.",
+    },
+    "devices.approveRequest": {
+        args: ["requestID"],
+        confirm: true,
+        description: "Approve a pending device registration request.",
+    },
+    "devices.delete": {
+        args: ["deviceID"],
+        confirm: true,
+        description: "Delete one account device.",
+    },
+    "devices.getRequest": {
+        args: ["requestID"],
+        description: "Fetch one pending device request.",
+    },
+    "devices.list": {
+        args: [],
+        description: "List this account's devices.",
+    },
+    "devices.listRequests": {
+        args: [],
+        description: "List pending or processed device requests.",
+    },
+    "devices.pollPendingRegistration": {
+        args: ["{challenge,requestID}"],
+        description: "Poll a pending registration request as the requesting device.",
+    },
+    "devices.publishPendingRegistration": {
+        args: ["{challenge,requestID}"],
+        confirm: true,
+        description: "Notify existing devices about a pending enrollment.",
+    },
+    "devices.register": {
+        args: [],
+        confirm: true,
+        description: "Register current key material as a new device.",
+    },
+    "devices.rejectRequest": {
+        args: ["requestID"],
+        confirm: true,
+        description: "Reject a pending device registration request.",
+    },
+    "devices.retrieve": {
+        args: ["deviceIdentifier"],
+        description: "Fetch one device by ID or identifier.",
+    },
+    "emoji.create": {
+        args: ["bytes", "name", "serverID"],
+        confirm: true,
+        description: "Upload a custom emoji. Pass bytes as {type:'bytes',base64:'...'} or {type:'bytes',text:'...'}",
+    },
+    "emoji.retrieve": {
+        args: ["emojiID"],
+        description: "Fetch one emoji by ID.",
+    },
+    "emoji.retrieveList": {
+        args: ["serverID"],
+        description: "List emojis available on a server.",
+    },
+    "files.create": {
+        args: ["bytes"],
+        confirm: true,
+        description: "Upload an encrypted file. Pass bytes as {type:'bytes',base64:'...'} or {type:'bytes',text:'...'}",
+    },
+    "files.retrieve": {
+        args: ["fileID", "key"],
+        description: "Download and decrypt a file.",
+    },
+    "getHost": {
+        args: [],
+        description: "Return the current HTTP API origin.",
+    },
+    "getKeys": {
+        args: [],
+        sensitive: true,
+        description: "Return this device's public key; private key is redacted.",
+    },
+    "getLocalMessageRetentionDays": {
+        args: [],
+        description: "Return the local message retention cap.",
+    },
+    "invites.create": {
+        args: ["serverID", "duration"],
+        confirm: true,
+        description: "Create an invite for a server.",
+    },
+    "invites.redeem": {
+        args: ["inviteID"],
+        confirm: true,
+        description: "Redeem an invite.",
+    },
+    "invites.retrieve": {
+        args: ["serverID"],
+        description: "List active invites for a server.",
+    },
+    "me.device": {
+        args: [],
+        description: "Return current authenticated device metadata.",
+    },
+    "me.setAvatar": {
+        args: ["bytes"],
+        confirm: true,
+        description: "Upload and set a new avatar. Pass bytes as {type:'bytes',base64:'...'} or {type:'bytes',text:'...'}",
+    },
+    "me.user": {
+        args: [],
+        description: "Return current authenticated user profile.",
+    },
+    "messages.delete": {
+        args: ["userOrChannelID"],
+        confirm: true,
+        description: "Delete local history for a user or channel.",
+    },
+    "messages.group": {
+        args: ["channelID", "message", "opts?"],
+        confirm: true,
+        description: "Send an encrypted group message.",
+    },
+    "messages.purge": {
+        args: [],
+        confirm: true,
+        description: "Delete all locally stored message history.",
+    },
+    "messages.retrieve": {
+        args: ["userID"],
+        description: "Return local direct-message history with one user.",
+    },
+    "messages.retrieveGroup": {
+        args: ["channelID"],
+        description: "Return local group-message history for one channel.",
+    },
+    "messages.send": {
+        args: ["userID", "message", "opts?"],
+        confirm: true,
+        description: "Send an encrypted direct message.",
+    },
+    "moderation.fetchPermissionList": {
+        args: ["serverID"],
+        description: "Return all permission entries for a server.",
+    },
+    "moderation.kick": {
+        args: ["userID", "serverID"],
+        confirm: true,
+        description: "Kick a user from a server.",
+    },
+    "passkeys.approveDeviceRequest": {
+        args: ["requestID"],
+        confirm: true,
+        description: "Approve a pending device request using a passkey session.",
+    },
+    "passkeys.beginAuthentication": {
+        args: ["username"],
+        description: "Begin a passkey authentication ceremony.",
+    },
+    "passkeys.beginRegistration": {
+        args: ["name"],
+        confirm: true,
+        description: "Begin adding a new passkey.",
+    },
+    "passkeys.delete": {
+        args: ["passkeyID"],
+        confirm: true,
+        description: "Delete a passkey.",
+    },
+    "passkeys.deleteDevice": {
+        args: ["deviceID"],
+        confirm: true,
+        description: "Delete one account device using a passkey session.",
+    },
+    "passkeys.finishAuthentication": {
+        args: ["{requestID,response}"],
+        confirm: true,
+        description: "Finish passkey authentication with a WebAuthn assertion.",
+    },
+    "passkeys.finishRegistration": {
+        args: ["{name,requestID,response}"],
+        confirm: true,
+        description: "Finish adding a passkey with a WebAuthn registration response.",
+    },
+    "passkeys.list": {
+        args: [],
+        description: "List account passkeys.",
+    },
+    "passkeys.listDevices": {
+        args: [],
+        description: "List account devices using a passkey session.",
+    },
+    "passkeys.rejectDeviceRequest": {
+        args: ["requestID"],
+        confirm: true,
+        description: "Reject a pending device request using a passkey session.",
+    },
+    "permissions.delete": {
+        args: ["permissionID"],
+        confirm: true,
+        description: "Delete one permission grant.",
+    },
+    "permissions.retrieve": {
+        args: [],
+        description: "List permissions granted to this user.",
+    },
+    "servers.create": {
+        args: ["name"],
+        confirm: true,
+        description: "Create a server.",
+    },
+    "servers.delete": {
+        args: ["serverID"],
+        confirm: true,
+        description: "Delete a server.",
+    },
+    "servers.leave": {
+        args: ["serverID"],
+        confirm: true,
+        description: "Leave a server.",
+    },
+    "servers.retrieve": {
+        args: [],
+        description: "List servers available to this user.",
+    },
+    "servers.retrieveByID": {
+        args: ["serverID"],
+        description: "Get one server by ID.",
+    },
+    "servers.retrieveWithChannels": {
+        args: [],
+        description: "Fetch servers and channels in one payload.",
+    },
+    "sessions.markVerified": {
+        args: ["fingerprint"],
+        confirm: true,
+        description: "Mark one encryption session as verified.",
+    },
+    "sessions.retrieve": {
+        args: [],
+        description: "Return all locally known encryption sessions.",
+    },
+    "sessions.verify": {
+        args: ["session"],
+        description: "Build a human-readable verification phrase from a session object.",
+    },
+    "setLocalMessageRetentionDays": {
+        args: ["days"],
+        confirm: true,
+        description: "Update local message retention cap and prune immediately.",
+    },
+    "subscribeNotifications": {
+        args: ["{channel,token,events?,platform?}"],
+        confirm: true,
+        description: "Register a push notification subscription.",
+    },
+    "syncInboxNow": {
+        args: [],
+        description: "Trigger an immediate inbox sync.",
+    },
+    "toString": {
+        args: [],
+        description: "Return a compact debug label.",
+    },
+    "unsubscribeNotifications": {
+        args: ["subscriptionID"],
+        confirm: true,
+        description: "Remove a push notification subscription.",
+    },
+    "users.familiars": {
+        args: [],
+        description: "Return users with active local sessions.",
+    },
+    "users.retrieve": {
+        args: ["identifier"],
+        description: "Look up a user by user ID, username, or signing key.",
+    },
+    "whoami": {
+        args: [],
+        sensitive: true,
+        description: "Return authenticated session details; bearer token is redacted if present.",
+    },
+});
+
+const BLOCKED_VEX_API_METHODS = Object.freeze({
+    close: "Would shut down the running bot process.",
+    connect: "The bot already owns its websocket lifecycle.",
+    deleteAllData: "Would wipe local bot data and credentials state.",
+    login: "Would replace the bot's authenticated session.",
+    loginWithDeviceKey: "Would replace the bot's authenticated session.",
+    logout: "Would log out the running bot.",
+    reconnectWebsocket: "The PM2 process owns reconnect behavior for this bot.",
+    register: "Would create or switch accounts outside the configured bot identity.",
+});
+
 main().catch((err) => {
     console.error(err instanceof Error ? err.message : String(err));
     process.exitCode = 1;
@@ -460,7 +777,7 @@ function buildVexToolInstructions(settings) {
     if (settings.vexToolSteps <= 0) {
         return "Vex tools are disabled for this run.";
     }
-    return `You may inspect Vex through read-only tools backed by libvex.
+    return `You may inspect and operate Vex through tools backed by libvex.
 Available tools:
 - vex.current_chat: details about the current DM or channel and the prompting user. Arguments: {}.
 - vex.list_servers: list servers visible to this bot, with channels. Arguments: {}.
@@ -473,11 +790,13 @@ Available tools:
 - vex.local_memory: read this bot's rolling memory summary for the current chat or all chats. Arguments: {"scope":"current|all","limit":10}.
 - vex.lookup_user: look up a user by username or user id. Arguments: {"identifier":"..."}.
 - vex.my_profile: show the bot's current user and device ids. Arguments: {}.
+- vex.api_surface: list callable libvex public API methods. Arguments: {"namespace":"optional namespace such as messages, servers, channels"}.
+- vex.api: call a public libvex method by path. Arguments: {"path":"messages.retrieveGroup","args":["channel-id"]}. Mutating calls require {"confirm":true,"reason":"..."}.
 
 When you need a Vex tool, reply with only this JSON:
 {"type":"tool","name":"vex.current_chat","arguments":{}}
 
-Call at most one tool per response. Do not invent Vex IDs; use tools to discover them. After tool results are provided, answer normally in plain text.`;
+Call at most one tool per response. Do not invent Vex IDs; use tools to discover them. Use the normal final answer for ordinary replies; do not call messages.send or messages.group just to answer the prompt. After tool results are provided, answer normally in plain text.`;
 }
 
 function formatToolTraceEntry(entry) {
@@ -633,6 +952,12 @@ async function runVexTool(client, settings, source, toolCall) {
         case "vex.my_profile":
             result = vexMyProfile(client);
             break;
+        case "vex.api_surface":
+            result = vexApiSurface(args);
+            break;
+        case "vex.api":
+            result = await vexApiCall(client, args);
+            break;
         default:
             result = {
                 error: `Unknown Vex tool: ${toolCall.name}`,
@@ -648,12 +973,183 @@ async function runVexTool(client, settings, source, toolCall) {
                     "vex.local_memory",
                     "vex.lookup_user",
                     "vex.my_profile",
+                    "vex.api_surface",
+                    "vex.api",
                 ],
             };
     }
     const clipped = clipToolResult(result);
     logDebug(settings, `tool ${toolCall.name} -> ${JSON.stringify(clipped)}`);
     return clipped;
+}
+
+function vexApiSurface(args) {
+    const namespace = String(args.namespace ?? args.ns ?? "").trim();
+    const methods = Object.entries(VEX_API_SURFACE)
+        .filter(([pathName]) => !namespace || pathName.startsWith(`${namespace}.`))
+        .map(([pathName, spec]) => ({
+            args: spec.args,
+            confirmRequired: Boolean(spec.confirm),
+            description: spec.description,
+            path: pathName,
+            sensitiveResult: Boolean(spec.sensitive),
+        }));
+    const blocked = Object.entries(BLOCKED_VEX_API_METHODS).map(
+        ([pathName, reason]) => ({ path: pathName, reason }),
+    );
+    return { blocked, methods, namespace: namespace || null };
+}
+
+async function vexApiCall(client, args) {
+    const pathName = String(args.path ?? args.method ?? "").trim();
+    if (!pathName) {
+        return {
+            error: "path is required, for example messages.retrieveGroup",
+            surfaceTool: "vex.api_surface",
+        };
+    }
+    const blockedReason = BLOCKED_VEX_API_METHODS[pathName];
+    if (blockedReason) {
+        return { blocked: true, error: blockedReason, path: pathName };
+    }
+    const spec = VEX_API_SURFACE[pathName];
+    if (!spec) {
+        return {
+            error: `Unsupported libvex API method: ${pathName}`,
+            knownSimilar: similarApiPaths(pathName),
+            surfaceTool: "vex.api_surface",
+        };
+    }
+    if (spec.confirm && args.confirm !== true) {
+        return {
+            confirmRequired: true,
+            error: `${pathName} mutates Vex or local bot state. Call again with confirm:true and a brief reason if this is intentional.`,
+            path: pathName,
+        };
+    }
+    const { fn, thisValue } = resolveApiFunction(client, pathName);
+    const callArgs = resolveApiCallArgs(args, spec).map(materializeApiArg);
+    const result = await fn.apply(thisValue, callArgs);
+    return {
+        path: pathName,
+        result: sanitizeApiResult(pathName, result),
+    };
+}
+
+function similarApiPaths(pathName) {
+    const lower = pathName.toLowerCase();
+    return Object.keys(VEX_API_SURFACE)
+        .filter(
+            (candidate) =>
+                candidate.toLowerCase().includes(lower) ||
+                lower.includes(candidate.toLowerCase().split(".").at(-1)),
+        )
+        .slice(0, 10);
+}
+
+function resolveApiFunction(client, pathName) {
+    const parts = pathName.split(".");
+    let target = client;
+    for (const part of parts.slice(0, -1)) {
+        target = target?.[part];
+    }
+    const method = target?.[parts.at(-1)];
+    if (typeof method !== "function") {
+        throw new Error(`libvex method is not callable: ${pathName}`);
+    }
+    return { fn: method, thisValue: target };
+}
+
+function resolveApiCallArgs(args, spec) {
+    if (Array.isArray(args.args)) return args.args;
+    if (spec.args.length === 1 && spec.args[0].startsWith("{")) {
+        return [apiNamedObjectArgs(args)];
+    }
+    return spec.args
+        .filter((name) => !name.endsWith("?"))
+        .map((name) => args[apiArgObjectKey(name)]);
+}
+
+function apiNamedObjectArgs(args) {
+    return Object.fromEntries(
+        Object.entries(args).filter(
+            ([key]) =>
+                !["args", "confirm", "method", "path", "reason"].includes(key),
+        ),
+    );
+}
+
+function apiArgObjectKey(name) {
+    return name.replace(/[{}?]/g, "").split(",")[0];
+}
+
+function materializeApiArg(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return value;
+    }
+    if (
+        value.type === "bytes" ||
+        value.kind === "bytes" ||
+        value.__type === "Uint8Array"
+    ) {
+        if (typeof value.base64 === "string") {
+            return Uint8Array.from(Buffer.from(value.base64, "base64"));
+        }
+        if (typeof value.hex === "string") {
+            return Uint8Array.from(Buffer.from(value.hex, "hex"));
+        }
+        if (typeof value.text === "string") {
+            return Uint8Array.from(Buffer.from(value.text, "utf8"));
+        }
+        if (Array.isArray(value.bytes)) {
+            return Uint8Array.from(value.bytes);
+        }
+    }
+    return value;
+}
+
+function sanitizeApiResult(pathName, value) {
+    if (pathName === "getKeys") {
+        return {
+            private: "[redacted]",
+            public: value?.public,
+        };
+    }
+    return sanitizeApiValue(value);
+}
+
+function sanitizeApiValue(value, seen = new WeakSet()) {
+    if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
+        return {
+            bytes: value.byteLength,
+            previewBase64: Buffer.from(value).subarray(0, 64).toString("base64"),
+            truncated: value.byteLength > 64,
+        };
+    }
+    if (value instanceof Map) {
+        return sanitizeApiValue(Object.fromEntries(value.entries()), seen);
+    }
+    if (value instanceof Date) return value.toISOString();
+    if (!value || typeof value !== "object") return value;
+    if (seen.has(value)) return "[circular]";
+    seen.add(value);
+    if (Array.isArray(value)) {
+        return value.map((item) => sanitizeApiValue(item, seen));
+    }
+    return Object.fromEntries(
+        Object.entries(value).map(([key, child]) => [
+            key,
+            shouldRedactApiField(key)
+                ? "[redacted]"
+                : sanitizeApiValue(child, seen),
+        ]),
+    );
+}
+
+function shouldRedactApiField(key) {
+    return /^(private|privateKey|token|bearer|password|secret|SK|keyData)$/i.test(
+        key,
+    );
 }
 
 async function vexCurrentChat(client, source) {

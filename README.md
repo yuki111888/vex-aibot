@@ -16,8 +16,9 @@ model needs live Vex context. It can inspect the current chat, visible servers
 and channels, channel members, recent local message history, user profiles, and
 its own account/device profile. It can also inspect its own local state through
 libvex APIs, including decrypted message search, sanitized session metadata, and
-rolling memory summaries. It cannot send extra messages or mutate Vex state
-through tools; its only write is the normal final reply.
+rolling memory summaries. A generic `vex.api` tool exposes the public libvex
+API surface; mutating calls require an explicit `confirm: true`, and private
+keys/tokens are redacted from tool results.
 
 The bot keeps a compact rolling memory summary per DM or channel. Prompts use
 that summary plus the freshest raw messages, and the summary is rewritten after
