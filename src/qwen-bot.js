@@ -355,8 +355,22 @@ function parseToolCall(content) {
     const withoutPrefix = trimmed.startsWith("TOOL_CALL:")
         ? trimmed.slice("TOOL_CALL:".length).trim()
         : trimmed;
-    const fenced = withoutPrefix.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-    const jsonText = fenced ? fenced[1].trim() : withoutPrefix;
+    const candidates = [withoutPrefix];
+    const fenced = withoutPrefix.match(/```(?:json)?\s*({[\s\S]*?})\s*```/i);
+    if (fenced?.[1]) candidates.unshift(fenced[1].trim());
+    const firstBrace = withoutPrefix.indexOf("{");
+    const lastBrace = withoutPrefix.lastIndexOf("}");
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+        candidates.push(withoutPrefix.slice(firstBrace, lastBrace + 1));
+    }
+    for (const jsonText of candidates) {
+        const toolCall = parseToolCallJson(jsonText);
+        if (toolCall) return toolCall;
+    }
+    return null;
+}
+
+function parseToolCallJson(jsonText) {
     if (!jsonText.startsWith("{")) return null;
     try {
         const parsed = JSON.parse(jsonText);
