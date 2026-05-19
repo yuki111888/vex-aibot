@@ -16,7 +16,9 @@ const LEGACY_COMMANDS = ["/llm", "/qwen"];
 const MAX_REPLY_CHARS = 1800;
 const DEFAULT_SYNC_INTERVAL_MS = 5000;
 const DEFAULT_CONTEXT_MESSAGES = 24;
+const DEFAULT_VEX_TOOL_STEPS = 3;
 const MAX_CONTEXT_LINE_CHARS = 500;
+const MAX_TOOL_RESULT_CHARS = 4000;
 
 const names = new Map();
 
@@ -233,57 +235,353 @@ async function completeWithModel(client, settings, source, prompt) {
                 return "";
             },
         );
-        const userContent = buildModelPrompt(settings, prompt, context);
-        let res;
-        try {
-            res = await fetch(settings.llmChatCompletionsUrl, {
-                body: JSON.stringify({
-                    messages: [{ content: userContent, role: "user" }],
-                    model: settings.model,
-                    stream: false,
-                }),
+        const toolTrace = [];
+        for (let step = 0; ; step++) {
+            const userContent = buildModelPrompt(
+                settings,
+                prompt,
+                context,
+                toolTrace,
+            );
+            const content = await requestChatCompletion(
+                settings,
                 headers,
-                method: "POST",
-                signal: controller.signal,
-            });
-        } catch (err) {
-            throw new Error(
-                `could not reach ${settings.llmChatCompletionsUrl}: ${formatError(err)}`,
+                controller.signal,
+                userContent,
             );
-        }
-        const body = await res.text();
-        if (!res.ok) {
-            throw new Error(
-                `LLM request failed with ${res.status}: ${body.slice(0, 500)}`,
+            const toolCall = parseToolCall(content);
+            if (!toolCall) return cleanupFinalAnswer(content);
+            if (step >= settings.vexToolSteps) {
+                return `I wanted to use ${toolCall.name}, but I hit my Vex tool-call limit.`;
+            }
+
+            const result = await runVexTool(
+                client,
+                settings,
+                source,
+                toolCall,
             );
+            toolTrace.push({ call: toolCall, result });
         }
-        let parsed;
-        try {
-            parsed = JSON.parse(body);
-        } catch {
-            throw new Error(`LLM returned non-JSON: ${body.slice(0, 500)}`);
-        }
-        const content =
-            parsed?.choices?.[0]?.message?.content ??
-            parsed?.choices?.[0]?.text ??
-            "";
-        return String(content).trim() || "(empty response)";
     } finally {
         clearTimeout(timer);
     }
 }
 
-function buildModelPrompt(settings, prompt, context) {
+async function requestChatCompletion(settings, headers, signal, userContent) {
+    let res;
+    try {
+        res = await fetch(settings.llmChatCompletionsUrl, {
+            body: JSON.stringify({
+                messages: [{ content: userContent, role: "user" }],
+                model: settings.model,
+                stream: false,
+            }),
+            headers,
+            method: "POST",
+            signal,
+        });
+    } catch (err) {
+        throw new Error(
+            `could not reach ${settings.llmChatCompletionsUrl}: ${formatError(err)}`,
+        );
+    }
+    const body = await res.text();
+    if (!res.ok) {
+        throw new Error(
+            `LLM request failed with ${res.status}: ${body.slice(0, 500)}`,
+        );
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(body);
+    } catch {
+        throw new Error(`LLM returned non-JSON: ${body.slice(0, 500)}`);
+    }
+    const content =
+        parsed?.choices?.[0]?.message?.content ??
+        parsed?.choices?.[0]?.text ??
+        "";
+    return String(content).trim() || "(empty response)";
+}
+
+function buildModelPrompt(settings, prompt, context, toolTrace = []) {
     const parts = [
         `You are ${settings.username}, an AI assistant inside a Vex chat.`,
         "Answer directly and keep the response useful.",
         "If recent chat context is provided, use it as memory for this conversation, but do not quote it unless helpful.",
+        buildVexToolInstructions(settings),
     ];
     if (context) {
         parts.push(`Recent chat context, oldest to newest:\n${context}`);
     }
+    if (toolTrace.length > 0) {
+        parts.push(
+            `Vex tool results so far:\n${toolTrace
+                .map(formatToolTraceEntry)
+                .join("\n\n")}`,
+        );
+    }
     parts.push(`Current prompt:\n${prompt}`);
     return parts.join("\n\n");
+}
+
+function buildVexToolInstructions(settings) {
+    if (settings.vexToolSteps <= 0) {
+        return "Vex tools are disabled for this run.";
+    }
+    return `You may inspect Vex through read-only tools backed by libvex.
+Available tools:
+- vex.current_chat: details about the current DM or channel and the prompting user. Arguments: {}.
+- vex.list_servers: list servers visible to this bot, with channels. Arguments: {}.
+- vex.list_channels: list channels in a server. Arguments: {"server_id":"..."}; omit server_id to use the current channel's server.
+- vex.channel_members: list users visible in a channel. Arguments: {"channel_id":"..."}; omit channel_id to use the current channel.
+- vex.recent_messages: read recent local encrypted history. Arguments: {"channel_id":"...","user_id":"...","limit":20}; omit channel_id/user_id to use the current chat.
+- vex.lookup_user: look up a user by username or user id. Arguments: {"identifier":"..."}.
+- vex.my_profile: show the bot's current user and device ids. Arguments: {}.
+
+When you need a Vex tool, reply with only this JSON:
+{"type":"tool","name":"vex.current_chat","arguments":{}}
+
+Call at most one tool per response. Do not invent Vex IDs; use tools to discover them. After tool results are provided, answer normally in plain text.`;
+}
+
+function formatToolTraceEntry(entry) {
+    return `Tool call: ${JSON.stringify(entry.call)}\nTool result: ${JSON.stringify(entry.result)}`;
+}
+
+function parseToolCall(content) {
+    const trimmed = String(content ?? "").trim();
+    const jsonText = trimmed.startsWith("TOOL_CALL:")
+        ? trimmed.slice("TOOL_CALL:".length).trim()
+        : trimmed;
+    if (!jsonText.startsWith("{")) return null;
+    try {
+        const parsed = JSON.parse(jsonText);
+        const type = String(parsed.type ?? "").toLowerCase();
+        const name = parsed.name ?? parsed.tool ?? parsed.tool_name;
+        if (type !== "tool" || typeof name !== "string") return null;
+        const args =
+            parsed.arguments && typeof parsed.arguments === "object"
+                ? parsed.arguments
+                : {};
+        return { arguments: args, name };
+    } catch {
+        return null;
+    }
+}
+
+function cleanupFinalAnswer(content) {
+    const text = String(content ?? "").trim();
+    if (!text) return "(empty response)";
+    try {
+        const parsed = JSON.parse(text);
+        if (typeof parsed.text === "string") return parsed.text.trim();
+        if (typeof parsed.answer === "string") return parsed.answer.trim();
+        if (typeof parsed.final === "string") return parsed.final.trim();
+    } catch {}
+    return text;
+}
+
+async function runVexTool(client, settings, source, toolCall) {
+    const args = toolCall.arguments ?? {};
+    let result;
+    switch (toolCall.name) {
+        case "vex.current_chat":
+            result = await vexCurrentChat(client, source);
+            break;
+        case "vex.list_servers":
+            result = await vexListServers(client);
+            break;
+        case "vex.list_channels":
+            result = await vexListChannels(client, source, args);
+            break;
+        case "vex.channel_members":
+            result = await vexChannelMembers(client, source, args);
+            break;
+        case "vex.recent_messages":
+            result = await vexRecentMessages(client, source, args);
+            break;
+        case "vex.lookup_user":
+            result = await vexLookupUser(client, args);
+            break;
+        case "vex.my_profile":
+            result = vexMyProfile(client);
+            break;
+        default:
+            result = {
+                error: `Unknown Vex tool: ${toolCall.name}`,
+                knownTools: [
+                    "vex.current_chat",
+                    "vex.list_servers",
+                    "vex.list_channels",
+                    "vex.channel_members",
+                    "vex.recent_messages",
+                    "vex.lookup_user",
+                    "vex.my_profile",
+                ],
+            };
+    }
+    const clipped = clipToolResult(result);
+    logDebug(settings, `tool ${toolCall.name} -> ${JSON.stringify(clipped)}`);
+    return clipped;
+}
+
+async function vexCurrentChat(client, source) {
+    const author = await usernameFor(client, source.authorID);
+    const base = {
+        bot: sanitizeUser(client.me.user()),
+        promptAuthor: { userID: source.authorID, username: author },
+        triggerMailID: source.mailID,
+    };
+    if (!source.group) {
+        return { ...base, kind: "dm", userID: source.authorID };
+    }
+    const channel = await client.channels.retrieveByID(source.group);
+    const server = channel?.serverID
+        ? await client.servers.retrieveByID(channel.serverID)
+        : null;
+    return {
+        ...base,
+        channel: sanitizeChannel(channel),
+        kind: "channel",
+        server: sanitizeServer(server),
+    };
+}
+
+async function vexListServers(client) {
+    const bootstrap = await client.servers.retrieveWithChannels();
+    return {
+        servers: bootstrap.servers.map((server) => ({
+            ...sanitizeServer(server),
+            channels: (bootstrap.channelsByServer[server.serverID] ?? []).map(
+                sanitizeChannel,
+            ),
+        })),
+    };
+}
+
+async function vexListChannels(client, source, args) {
+    const serverID = String(
+        args.server_id ?? args.serverID ?? (await currentServerID(client, source)) ?? "",
+    );
+    if (!serverID) {
+        return { error: "server_id is required outside a channel context" };
+    }
+    const [server, channels] = await Promise.all([
+        client.servers.retrieveByID(serverID),
+        client.channels.retrieve(serverID),
+    ]);
+    return {
+        channels: channels.map(sanitizeChannel),
+        server: sanitizeServer(server),
+    };
+}
+
+async function vexChannelMembers(client, source, args) {
+    const channelID = String(
+        args.channel_id ?? args.channelID ?? source.group ?? "",
+    );
+    if (!channelID) {
+        return { error: "channel_id is required outside a channel context" };
+    }
+    const [channel, users] = await Promise.all([
+        client.channels.retrieveByID(channelID),
+        client.channels.userList(channelID),
+    ]);
+    return {
+        channel: sanitizeChannel(channel),
+        users: users.map(sanitizeUser),
+    };
+}
+
+async function vexRecentMessages(client, source, args) {
+    const limit = clampInt(args.limit, 20, 1, 50);
+    const channelID = args.channel_id ?? args.channelID;
+    const userID = args.user_id ?? args.userID;
+    const history =
+        channelID || (!userID && source.group)
+            ? await client.messages.retrieveGroup(String(channelID ?? source.group))
+            : await client.messages.retrieve(String(userID ?? source.authorID));
+    const sorted = history
+        .filter((message) => message.decrypted && message.message.trim())
+        .sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)))
+        .slice(-limit);
+    const messages = [];
+    for (const message of sorted) {
+        messages.push({
+            authorID: message.authorID,
+            group: message.group,
+            mailID: message.mailID,
+            message: truncateForContext(message.message.replace(/\s+/g, " ")),
+            timestamp: message.timestamp,
+            username: await usernameFor(client, message.authorID),
+        });
+    }
+    return { messages };
+}
+
+async function vexLookupUser(client, args) {
+    const identifier = String(args.identifier ?? args.user ?? "").trim();
+    if (!identifier) return { error: "identifier is required" };
+    const [user, err] = await client.users.retrieve(identifier);
+    if (err) return { error: err.message };
+    return { user: sanitizeUser(user) };
+}
+
+function vexMyProfile(client) {
+    return {
+        device: { deviceID: client.me.device().deviceID },
+        user: sanitizeUser(client.me.user()),
+    };
+}
+
+async function currentServerID(client, source) {
+    if (!source.group) return null;
+    const channel = await client.channels.retrieveByID(source.group);
+    return channel?.serverID ?? null;
+}
+
+function clipToolResult(result) {
+    const json = JSON.stringify(result);
+    if (json.length <= MAX_TOOL_RESULT_CHARS) return result;
+    return {
+        truncated: true,
+        value: `${json.slice(0, MAX_TOOL_RESULT_CHARS - 3)}...`,
+    };
+}
+
+function sanitizeServer(server) {
+    if (!server) return null;
+    return {
+        icon: server.icon,
+        name: server.name,
+        serverID: server.serverID,
+    };
+}
+
+function sanitizeChannel(channel) {
+    if (!channel) return null;
+    return {
+        channelID: channel.channelID,
+        name: channel.name,
+        serverID: channel.serverID,
+    };
+}
+
+function sanitizeUser(user) {
+    if (!user) return null;
+    return {
+        lastSeen: user.lastSeen,
+        userID: user.userID,
+        username: user.username,
+    };
+}
+
+function clampInt(value, fallback, min, max) {
+    const parsed = Number.parseInt(String(value ?? fallback), 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(max, Math.max(min, parsed));
 }
 
 async function buildChatContext(client, settings, source) {
@@ -493,6 +791,14 @@ async function resolveSettings(flags) {
         ),
         10,
     );
+    const vexToolSteps = Number.parseInt(
+        String(
+            flags["vex-tool-steps"] ??
+                process.env.VEX_QWEN_TOOL_STEPS ??
+                DEFAULT_VEX_TOOL_STEPS,
+        ),
+        10,
+    );
     const llmChatCompletionsUrl = normalizeChatCompletionsUrl(llmUrl);
 
     return {
@@ -536,6 +842,9 @@ async function resolveSettings(flags) {
             process.env.VEX_QWEN_DEBUG === "1" ||
             process.env.VEX_QWEN_DEBUG === "true",
         username,
+        vexToolSteps: Number.isFinite(vexToolSteps)
+            ? Math.max(0, vexToolSteps)
+            : DEFAULT_VEX_TOOL_STEPS,
     };
 }
 
@@ -722,6 +1031,7 @@ Options:
   --dev-key <key>            x-dev-api-key for local Spire
   --password <password>      Optional password for first registration
   --context-messages <n>     Recent DM/channel messages to send as context (default: ${DEFAULT_CONTEXT_MESSAGES})
+  --vex-tool-steps <n>       Read-only Vex tool calls allowed per prompt (default: ${DEFAULT_VEX_TOOL_STEPS})
   --llm-timeout-ms <ms>      LLM request timeout (default: 120000)
   --sync-interval-ms <ms>    Poll inbox in addition to websocket notify (default: ${DEFAULT_SYNC_INTERVAL_MS})
   --debug                    Log ignored messages, sync, and context activity
@@ -730,5 +1040,6 @@ Options:
 Environment equivalents:
   VEX_QWEN_INVITE, VEX_QWEN_LLM_URL, VEX_QWEN_MODEL, VEX_QWEN_DATA_DIR,
   VEX_QWEN_USERNAME, VEX_QWEN_PASSWORD, VEX_QWEN_LLM_API_KEY,
-  VEX_QWEN_CONTEXT_MESSAGES, VEX_QWEN_SYNC_INTERVAL_MS, VEX_QWEN_DEBUG`);
+  VEX_QWEN_CONTEXT_MESSAGES, VEX_QWEN_TOOL_STEPS, VEX_QWEN_SYNC_INTERVAL_MS,
+  VEX_QWEN_DEBUG`);
 }

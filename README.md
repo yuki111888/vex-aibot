@@ -7,6 +7,12 @@ Standalone libvex bot that creates or reuses an `llm` user, joins
 Responses come from the local OpenAI-compatible llama.cpp endpoint at
 `http://192.168.0.123:8080/v1/chat/completions` with `model: "Qwen2"`.
 
+The bot can also use read-only Vex tools through `@vex-chat/libvex` when the
+model needs live Vex context. It can inspect the current chat, visible servers
+and channels, channel members, recent local message history, user profiles, and
+its own account/device profile. It cannot send extra messages or mutate Vex
+state through tools; its only write is the normal final reply.
+
 ## Setup
 
 ```sh
@@ -41,6 +47,7 @@ Important environment overrides:
 - `VEX_QWEN_INVITE`
 - `VEX_QWEN_DATA_DIR`
 - `VEX_QWEN_CONTEXT_MESSAGES`
+- `VEX_QWEN_TOOL_STEPS`
 - `VEX_QWEN_DEBUG`
 
 Persistent bot state defaults to `~/.vex-llm-bot`.
