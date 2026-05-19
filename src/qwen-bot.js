@@ -15,12 +15,15 @@ const DEFAULT_USERNAME = "llm";
 const LEGACY_COMMANDS = ["/llm", "/qwen"];
 const MAX_REPLY_CHARS = 1800;
 const DEFAULT_SYNC_INTERVAL_MS = 5000;
-const DEFAULT_CONTEXT_MESSAGES = 24;
+const DEFAULT_CONTEXT_MESSAGES = 12;
+const DEFAULT_CONTEXT_CHARS = 1600;
 const DEFAULT_VEX_TOOL_STEPS = 3;
-const MAX_CONTEXT_LINE_CHARS = 500;
-const MAX_TOOL_RESULT_CHARS = 4000;
+const MAX_CONTEXT_LINE_CHARS = 220;
+const MAX_TOOL_RESULT_CHARS = 1800;
 
 const names = new Map();
+
+class ContextExceededError extends Error {}
 
 main().catch((err) => {
     console.error(err instanceof Error ? err.message : String(err));
@@ -236,40 +239,70 @@ async function completeWithModel(client, settings, source, prompt) {
             },
         );
         const toolTrace = [];
+        let contextMode = 0;
         for (let step = 0; ; step++) {
+            const activeContext = contextForMode(settings, context, contextMode);
             const userContent = buildModelPrompt(
                 settings,
                 prompt,
-                context,
+                activeContext,
                 toolTrace,
             );
-            const content = await requestChatCompletion(
-                settings,
-                headers,
-                controller.signal,
-                userContent,
-            );
+            let content;
+            try {
+                content = await requestChatCompletion(
+                    settings,
+                    headers,
+                    controller.signal,
+                    userContent,
+                );
+            } catch (err) {
+                if (err instanceof ContextExceededError && contextMode < 2) {
+                    contextMode++;
+                    logContextRetry(settings, contextMode);
+                    continue;
+                }
+                throw err;
+            }
             const toolCall = parseToolCall(content);
             if (!toolCall) return cleanupFinalAnswer(content);
             if (step >= settings.vexToolSteps) {
-                return await completeFromToolTrace(
-                    settings,
-                    headers,
-                    controller.signal,
-                    prompt,
-                    context,
-                    toolTrace,
-                );
+                try {
+                    return await completeFromToolTrace(
+                        settings,
+                        headers,
+                        controller.signal,
+                        prompt,
+                        activeContext,
+                        toolTrace,
+                    );
+                } catch (err) {
+                    if (err instanceof ContextExceededError && contextMode < 2) {
+                        contextMode++;
+                        logContextRetry(settings, contextMode);
+                        continue;
+                    }
+                    throw err;
+                }
             }
             if (hasToolCall(toolTrace, toolCall)) {
-                return await completeFromToolTrace(
-                    settings,
-                    headers,
-                    controller.signal,
-                    prompt,
-                    context,
-                    toolTrace,
-                );
+                try {
+                    return await completeFromToolTrace(
+                        settings,
+                        headers,
+                        controller.signal,
+                        prompt,
+                        activeContext,
+                        toolTrace,
+                    );
+                } catch (err) {
+                    if (err instanceof ContextExceededError && contextMode < 2) {
+                        contextMode++;
+                        logContextRetry(settings, contextMode);
+                        continue;
+                    }
+                    throw err;
+                }
             }
 
             const result = await runVexTool(
@@ -305,6 +338,11 @@ async function requestChatCompletion(settings, headers, signal, userContent) {
     }
     const body = await res.text();
     if (!res.ok) {
+        if (isContextExceeded(body)) {
+            throw new ContextExceededError(
+                `LLM request exceeded context: ${body.slice(0, 500)}`,
+            );
+        }
         throw new Error(
             `LLM request failed with ${res.status}: ${body.slice(0, 500)}`,
         );
@@ -320,6 +358,42 @@ async function requestChatCompletion(settings, headers, signal, userContent) {
         parsed?.choices?.[0]?.text ??
         "";
     return String(content).trim() || "(empty response)";
+}
+
+function isContextExceeded(body) {
+    return /request exceeds available context|exceeds available context|context.*exceed|exceed.*context|n_ctx/i.test(
+        String(body ?? ""),
+    );
+}
+
+function logContextRetry(settings, mode) {
+    logDebug(
+        settings,
+        `model context exceeded; retrying with ${mode === 1 ? "compacted" : "empty"} chat context`,
+    );
+}
+
+function contextForMode(settings, context, mode) {
+    if (!context || mode <= 0) return context;
+    if (mode >= 2) return "";
+    return compactContext(settings, context);
+}
+
+function compactContext(settings, context) {
+    const text = String(context ?? "").trim();
+    if (!text) return "";
+    const lines = text.split("\n").filter(Boolean);
+    const recent = [];
+    let used = 0;
+    const budget = Math.max(200, Math.floor(settings.contextChars / 2));
+    for (let i = lines.length - 1; i >= 0; i--) {
+        const line = truncateText(lines[i], 140);
+        const next = used + line.length + 1;
+        if (next > budget && recent.length > 0) break;
+        recent.unshift(line);
+        used = next;
+    }
+    return recent.join("\n");
 }
 
 function buildModelPrompt(settings, prompt, context, toolTrace = []) {
@@ -684,7 +758,7 @@ function clampInt(value, fallback, min, max) {
 }
 
 async function buildChatContext(client, settings, source) {
-    if (settings.contextMessages <= 0) return "";
+    if (settings.contextMessages <= 0 || settings.contextChars <= 0) return "";
     const history = source.group
         ? await client.messages.retrieveGroup(source.group)
         : await client.messages.retrieve(source.authorID);
@@ -697,8 +771,17 @@ async function buildChatContext(client, settings, source) {
     const previous = sourceIndex >= 0 ? sorted.slice(0, sourceIndex) : sorted;
     const recent = previous.slice(-settings.contextMessages);
     const lines = [];
-    for (const message of recent) {
-        lines.push(await formatContextMessage(client, message));
+    let used = 0;
+    for (let i = recent.length - 1; i >= 0; i--) {
+        const line = await formatContextMessage(client, recent[i]);
+        const next = used + line.length + 1;
+        if (next > settings.contextChars && lines.length > 0) break;
+        if (next > settings.contextChars) {
+            lines.unshift(truncateText(line, settings.contextChars));
+            break;
+        }
+        lines.unshift(line);
+        used = next;
     }
     return lines.join("\n");
 }
@@ -724,8 +807,14 @@ async function usernameFor(client, userID) {
 }
 
 function truncateForContext(text) {
-    if (text.length <= MAX_CONTEXT_LINE_CHARS) return text;
-    return `${text.slice(0, MAX_CONTEXT_LINE_CHARS - 3)}...`;
+    return truncateText(text, MAX_CONTEXT_LINE_CHARS);
+}
+
+function truncateText(text, maxChars) {
+    const value = String(text ?? "");
+    if (value.length <= maxChars) return value;
+    if (maxChars <= 3) return value.slice(0, Math.max(0, maxChars));
+    return `${value.slice(0, maxChars - 3)}...`;
 }
 
 async function checkLlm(settings) {
@@ -890,6 +979,14 @@ async function resolveSettings(flags) {
         ),
         10,
     );
+    const contextChars = Number.parseInt(
+        String(
+            flags["context-chars"] ??
+                process.env.VEX_QWEN_CONTEXT_CHARS ??
+                DEFAULT_CONTEXT_CHARS,
+        ),
+        10,
+    );
     const vexToolSteps = Number.parseInt(
         String(
             flags["vex-tool-steps"] ??
@@ -917,6 +1014,9 @@ async function resolveSettings(flags) {
         contextMessages: Number.isFinite(contextMessages)
             ? Math.max(0, contextMessages)
             : DEFAULT_CONTEXT_MESSAGES,
+        contextChars: Number.isFinite(contextChars)
+            ? Math.max(0, contextChars)
+            : DEFAULT_CONTEXT_CHARS,
         dataDir,
         invite: String(
             flags.invite ?? process.env.VEX_QWEN_INVITE ?? DEFAULT_INVITE,
@@ -1130,6 +1230,7 @@ Options:
   --dev-key <key>            x-dev-api-key for local Spire
   --password <password>      Optional password for first registration
   --context-messages <n>     Recent DM/channel messages to send as context (default: ${DEFAULT_CONTEXT_MESSAGES})
+  --context-chars <n>        Approximate recent-context character budget (default: ${DEFAULT_CONTEXT_CHARS})
   --vex-tool-steps <n>       Read-only Vex tool calls allowed per prompt (default: ${DEFAULT_VEX_TOOL_STEPS})
   --llm-timeout-ms <ms>      LLM request timeout (default: 120000)
   --sync-interval-ms <ms>    Poll inbox in addition to websocket notify (default: ${DEFAULT_SYNC_INTERVAL_MS})
@@ -1139,6 +1240,6 @@ Options:
 Environment equivalents:
   VEX_QWEN_INVITE, VEX_QWEN_LLM_URL, VEX_QWEN_MODEL, VEX_QWEN_DATA_DIR,
   VEX_QWEN_USERNAME, VEX_QWEN_PASSWORD, VEX_QWEN_LLM_API_KEY,
-  VEX_QWEN_CONTEXT_MESSAGES, VEX_QWEN_TOOL_STEPS, VEX_QWEN_SYNC_INTERVAL_MS,
-  VEX_QWEN_DEBUG`);
+  VEX_QWEN_CONTEXT_MESSAGES, VEX_QWEN_CONTEXT_CHARS, VEX_QWEN_TOOL_STEPS,
+  VEX_QWEN_SYNC_INTERVAL_MS, VEX_QWEN_DEBUG`);
 }
