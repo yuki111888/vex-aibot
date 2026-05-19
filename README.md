@@ -13,6 +13,10 @@ and channels, channel members, recent local message history, user profiles, and
 its own account/device profile. It cannot send extra messages or mutate Vex
 state through tools; its only write is the normal final reply.
 
+The bot keeps a compact rolling memory summary per DM or channel. Prompts use
+that summary plus the freshest raw messages, and the summary is rewritten after
+successful replies so long chats stay under the local model's context limit.
+
 ## Setup
 
 ```sh
@@ -48,7 +52,10 @@ Important environment overrides:
 - `VEX_QWEN_DATA_DIR`
 - `VEX_QWEN_CONTEXT_MESSAGES`
 - `VEX_QWEN_CONTEXT_CHARS`
+- `VEX_QWEN_MEMORY` (`0` disables rolling summaries)
+- `VEX_QWEN_MEMORY_SUMMARY_CHARS`
 - `VEX_QWEN_TOOL_STEPS`
 - `VEX_QWEN_DEBUG`
 
-Persistent bot state defaults to `~/.vex-llm-bot`.
+Persistent bot state defaults to `~/.vex-llm-bot`; rolling memory is stored in
+`~/.vex-llm-bot/llm-memory.json`.

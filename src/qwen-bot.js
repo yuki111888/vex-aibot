@@ -17,11 +17,14 @@ const MAX_REPLY_CHARS = 1800;
 const DEFAULT_SYNC_INTERVAL_MS = 5000;
 const DEFAULT_CONTEXT_MESSAGES = 12;
 const DEFAULT_CONTEXT_CHARS = 1600;
+const DEFAULT_MEMORY_SUMMARY_CHARS = 1200;
 const DEFAULT_VEX_TOOL_STEPS = 3;
 const MAX_CONTEXT_LINE_CHARS = 220;
 const MAX_TOOL_RESULT_CHARS = 1800;
+const MEMORY_VERSION = 1;
 
 const names = new Map();
+let memoryUpdateQueue = Promise.resolve();
 
 class ContextExceededError extends Error {}
 
@@ -197,8 +200,10 @@ async function handleMessage(client, settings, message) {
         `prompt from ${message.authorID}${message.group ? ` in ${message.group}` : ""}: ${prompt}`,
     );
     let output;
+    let completed = false;
     try {
         output = await completeWithModel(client, settings, message, prompt);
+        completed = true;
     } catch (err) {
         output = `${settings.username} error: ${formatError(err)}`;
     }
@@ -219,6 +224,14 @@ async function handleMessage(client, settings, message) {
             }
         }
     }
+
+    if (completed) {
+        void updateConversationMemory(client, settings, message, prompt, output).catch(
+            (err) => {
+                logDebug(settings, `memory update failed: ${formatError(err)}`);
+            },
+        );
+    }
 }
 
 async function completeWithModel(client, settings, source, prompt) {
@@ -229,15 +242,14 @@ async function completeWithModel(client, settings, source, prompt) {
         if (settings.llmApiKey) {
             headers.Authorization = `Bearer ${settings.llmApiKey}`;
         }
-        const context = await buildChatContext(client, settings, source).catch(
-            (err) => {
-                logDebug(
-                    settings,
-                    `context lookup failed: ${formatError(err)}`,
-                );
-                return "";
-            },
-        );
+        const context = await buildConversationContext(
+            client,
+            settings,
+            source,
+        ).catch((err) => {
+            logDebug(settings, `context lookup failed: ${formatError(err)}`);
+            return { recent: "", summary: "" };
+        });
         const toolTrace = [];
         let contextMode = 0;
         for (let step = 0; ; step++) {
@@ -257,7 +269,7 @@ async function completeWithModel(client, settings, source, prompt) {
                     userContent,
                 );
             } catch (err) {
-                if (err instanceof ContextExceededError && contextMode < 2) {
+                if (err instanceof ContextExceededError && contextMode < 3) {
                     contextMode++;
                     logContextRetry(settings, contextMode);
                     continue;
@@ -277,7 +289,7 @@ async function completeWithModel(client, settings, source, prompt) {
                         toolTrace,
                     );
                 } catch (err) {
-                    if (err instanceof ContextExceededError && contextMode < 2) {
+                    if (err instanceof ContextExceededError && contextMode < 3) {
                         contextMode++;
                         logContextRetry(settings, contextMode);
                         continue;
@@ -296,7 +308,7 @@ async function completeWithModel(client, settings, source, prompt) {
                         toolTrace,
                     );
                 } catch (err) {
-                    if (err instanceof ContextExceededError && contextMode < 2) {
+                    if (err instanceof ContextExceededError && contextMode < 3) {
                         contextMode++;
                         logContextRetry(settings, contextMode);
                         continue;
@@ -369,14 +381,38 @@ function isContextExceeded(body) {
 function logContextRetry(settings, mode) {
     logDebug(
         settings,
-        `model context exceeded; retrying with ${mode === 1 ? "compacted" : "empty"} chat context`,
+        `model context exceeded; retrying with ${describeContextMode(mode)}`,
     );
 }
 
 function contextForMode(settings, context, mode) {
-    if (!context || mode <= 0) return context;
-    if (mode >= 2) return "";
-    return compactContext(settings, context);
+    if (!context) return "";
+    const summary = truncateText(
+        String(context.summary ?? "").trim(),
+        settings.memorySummaryChars,
+    );
+    let recent = String(context.recent ?? "").trim();
+    if (mode === 1) recent = compactContext(settings, recent);
+    if (mode >= 2) recent = "";
+    if (mode >= 3) return "";
+    return formatConversationContext(summary, recent);
+}
+
+function describeContextMode(mode) {
+    if (mode === 1) return "compacted recent chat context";
+    if (mode === 2) return "memory summary only";
+    return "no chat memory";
+}
+
+function formatConversationContext(summary, recent) {
+    const parts = [];
+    if (summary) {
+        parts.push(`Rolling memory summary:\n${summary}`);
+    }
+    if (recent) {
+        parts.push(`Recent chat context, oldest to newest:\n${recent}`);
+    }
+    return parts.join("\n\n");
 }
 
 function compactContext(settings, context) {
@@ -400,11 +436,11 @@ function buildModelPrompt(settings, prompt, context, toolTrace = []) {
     const parts = [
         `You are ${settings.username}, an AI assistant inside a Vex chat.`,
         "Answer directly and keep the response useful.",
-        "If recent chat context is provided, use it as memory for this conversation, but do not quote it unless helpful.",
+        "If conversation context is provided, use it as memory for this conversation, but do not quote it unless helpful.",
         buildVexToolInstructions(settings),
     ];
     if (context) {
-        parts.push(`Recent chat context, oldest to newest:\n${context}`);
+        parts.push(`Conversation context:\n${context}`);
     }
     if (toolTrace.length > 0) {
         parts.push(
@@ -757,7 +793,18 @@ function clampInt(value, fallback, min, max) {
     return Math.min(max, Math.max(min, parsed));
 }
 
-async function buildChatContext(client, settings, source) {
+async function buildConversationContext(client, settings, source) {
+    const summary = settings.memoryEnabled
+        ? await readChatMemorySummary(settings, source).catch((err) => {
+              logDebug(settings, `memory read failed: ${formatError(err)}`);
+              return "";
+          })
+        : "";
+    const recent = await buildRecentChatContext(client, settings, source);
+    return { recent, summary };
+}
+
+async function buildRecentChatContext(client, settings, source) {
     if (settings.contextMessages <= 0 || settings.contextChars <= 0) return "";
     const history = source.group
         ? await client.messages.retrieveGroup(source.group)
@@ -784,6 +831,187 @@ async function buildChatContext(client, settings, source) {
         used = next;
     }
     return lines.join("\n");
+}
+
+async function readChatMemorySummary(settings, source) {
+    const store = await readMemoryStore(settings.memoryPath);
+    const entry = store.chats?.[chatMemoryKey(source)];
+    if (!entry || typeof entry.summary !== "string") return "";
+    return truncateText(entry.summary.trim(), settings.memorySummaryChars);
+}
+
+async function updateConversationMemory(client, settings, source, prompt, answer) {
+    if (!settings.memoryEnabled || settings.memorySummaryChars <= 0) return;
+    memoryUpdateQueue = memoryUpdateQueue
+        .catch(() => {})
+        .then(() =>
+            updateConversationMemoryNow(
+                client,
+                settings,
+                source,
+                prompt,
+                answer,
+            ),
+        );
+    await memoryUpdateQueue;
+}
+
+async function updateConversationMemoryNow(
+    client,
+    settings,
+    source,
+    prompt,
+    answer,
+) {
+    const key = chatMemoryKey(source);
+    const store = await readMemoryStore(settings.memoryPath).catch((err) => {
+        logDebug(settings, `memory store read failed: ${formatError(err)}`);
+        return createMemoryStore();
+    });
+    const previous = store.chats[key]?.summary ?? "";
+    const recent = await buildRecentChatContext(
+        client,
+        {
+            ...settings,
+            contextChars: Math.min(settings.contextChars, 900),
+            contextMessages: Math.min(settings.contextMessages, 6),
+        },
+        source,
+    ).catch(() => "");
+    const summary = await summarizeMemory(
+        client,
+        settings,
+        source,
+        previous,
+        recent,
+        prompt,
+        answer,
+    );
+    store.version = MEMORY_VERSION;
+    store.updatedAt = new Date().toISOString();
+    store.chats[key] = {
+        kind: source.group ? "channel" : "dm",
+        key,
+        lastMailID: source.mailID,
+        summary: truncateText(
+            cleanupMemorySummary(summary),
+            settings.memorySummaryChars,
+        ),
+        updatedAt: store.updatedAt,
+    };
+    await writeMemoryStore(settings.memoryPath, store);
+    logDebug(settings, `memory updated for ${key}`);
+}
+
+async function summarizeMemory(
+    client,
+    settings,
+    source,
+    previous,
+    recent,
+    prompt,
+    answer,
+) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), settings.llmTimeoutMs);
+    try {
+        const headers = { "Content-Type": "application/json" };
+        if (settings.llmApiKey) {
+            headers.Authorization = `Bearer ${settings.llmApiKey}`;
+        }
+        const author = await usernameFor(client, source.authorID).catch(
+            () => source.authorID,
+        );
+        const content = buildMemoryPrompt(settings, {
+            answer,
+            author,
+            previous,
+            prompt,
+            recent,
+        });
+        return await requestChatCompletion(
+            settings,
+            headers,
+            controller.signal,
+            content,
+        );
+    } catch (err) {
+        if (err instanceof ContextExceededError) {
+            logDebug(settings, "memory summary overflow; keeping previous memory");
+            return previous;
+        }
+        throw err;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function buildMemoryPrompt(
+    settings,
+    { answer, author, previous, prompt, recent },
+) {
+    return [
+        "Update the rolling memory summary for a Vex chat.",
+        `Keep it under ${settings.memorySummaryChars} characters.`,
+        "Keep durable facts, preferences, decisions, active plans, unresolved questions, project details, and names/roles.",
+        "Drop small talk, duplicates, one-off commands, and stale details. Do not invent facts.",
+        "Return only the updated summary text.",
+        `Previous summary:\n${truncateText(
+            previous || "(none)",
+            settings.memorySummaryChars,
+        )}`,
+        `Recent raw context:\n${truncateText(recent || "(none)", 900)}`,
+        `New exchange:\n${author}: ${truncateText(prompt, 700)}\n${
+            settings.username
+        }: ${truncateText(answer, 900)}`,
+    ].join("\n\n");
+}
+
+function cleanupMemorySummary(summary) {
+    const text = String(summary ?? "").trim();
+    return text
+        .replace(/^updated summary:\s*/i, "")
+        .replace(/^summary:\s*/i, "")
+        .trim();
+}
+
+async function readMemoryStore(memoryPath) {
+    try {
+        const raw = await fs.readFile(memoryPath, "utf8");
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object") return createMemoryStore();
+        return {
+            ...parsed,
+            chats:
+                parsed.chats && typeof parsed.chats === "object"
+                    ? parsed.chats
+                    : {},
+            version: parsed.version ?? MEMORY_VERSION,
+        };
+    } catch (err) {
+        if (err?.code === "ENOENT") return createMemoryStore();
+        throw err;
+    }
+}
+
+async function writeMemoryStore(memoryPath, store) {
+    const tempPath = `${memoryPath}.${process.pid}.tmp`;
+    await fs.writeFile(tempPath, JSON.stringify(store, null, 2), {
+        mode: 0o600,
+    });
+    await fs.rename(tempPath, memoryPath);
+}
+
+function createMemoryStore() {
+    return {
+        chats: {},
+        createdAt: new Date().toISOString(),
+        version: MEMORY_VERSION,
+    };
+}
+
+function chatMemoryKey(source) {
+    return source.group ? `channel:${source.group}` : `dm:${source.authorID}`;
 }
 
 async function formatContextMessage(client, message) {
@@ -987,6 +1215,14 @@ async function resolveSettings(flags) {
         ),
         10,
     );
+    const memorySummaryChars = Number.parseInt(
+        String(
+            flags["memory-summary-chars"] ??
+                process.env.VEX_QWEN_MEMORY_SUMMARY_CHARS ??
+                DEFAULT_MEMORY_SUMMARY_CHARS,
+        ),
+        10,
+    );
     const vexToolSteps = Number.parseInt(
         String(
             flags["vex-tool-steps"] ??
@@ -1028,6 +1264,15 @@ async function resolveSettings(flags) {
         llmChatCompletionsUrl,
         llmModelsUrl: normalizeModelsUrl(llmChatCompletionsUrl),
         llmTimeoutMs: Number.isFinite(llmTimeoutMs) ? llmTimeoutMs : 120000,
+        memoryEnabled:
+            !Boolean(flags["no-memory"]) &&
+            !["0", "false", "no", "off"].includes(
+                String(process.env.VEX_QWEN_MEMORY ?? "1").toLowerCase(),
+            ),
+        memoryPath: path.join(dataDir, `${username}-memory.json`),
+        memorySummaryChars: Number.isFinite(memorySummaryChars)
+            ? Math.max(0, memorySummaryChars)
+            : DEFAULT_MEMORY_SUMMARY_CHARS,
         model: String(
             flags.model ?? process.env.VEX_QWEN_MODEL ?? DEFAULT_MODEL,
         ),
@@ -1200,7 +1445,7 @@ function parseArgs(argv) {
             continue;
         }
         const key = arg.slice(2);
-        if (["debug", "help", "http", "local"].includes(key)) {
+        if (["debug", "help", "http", "local", "no-memory"].includes(key)) {
             flags[key] = true;
             continue;
         }
@@ -1231,6 +1476,8 @@ Options:
   --password <password>      Optional password for first registration
   --context-messages <n>     Recent DM/channel messages to send as context (default: ${DEFAULT_CONTEXT_MESSAGES})
   --context-chars <n>        Approximate recent-context character budget (default: ${DEFAULT_CONTEXT_CHARS})
+  --memory-summary-chars <n> Rolling per-chat summary budget (default: ${DEFAULT_MEMORY_SUMMARY_CHARS})
+  --no-memory                Disable rolling per-chat memory summaries
   --vex-tool-steps <n>       Read-only Vex tool calls allowed per prompt (default: ${DEFAULT_VEX_TOOL_STEPS})
   --llm-timeout-ms <ms>      LLM request timeout (default: 120000)
   --sync-interval-ms <ms>    Poll inbox in addition to websocket notify (default: ${DEFAULT_SYNC_INTERVAL_MS})
@@ -1240,6 +1487,7 @@ Options:
 Environment equivalents:
   VEX_QWEN_INVITE, VEX_QWEN_LLM_URL, VEX_QWEN_MODEL, VEX_QWEN_DATA_DIR,
   VEX_QWEN_USERNAME, VEX_QWEN_PASSWORD, VEX_QWEN_LLM_API_KEY,
-  VEX_QWEN_CONTEXT_MESSAGES, VEX_QWEN_CONTEXT_CHARS, VEX_QWEN_TOOL_STEPS,
+  VEX_QWEN_CONTEXT_MESSAGES, VEX_QWEN_CONTEXT_CHARS, VEX_QWEN_MEMORY,
+  VEX_QWEN_MEMORY_SUMMARY_CHARS, VEX_QWEN_TOOL_STEPS,
   VEX_QWEN_SYNC_INTERVAL_MS, VEX_QWEN_DEBUG`);
 }
