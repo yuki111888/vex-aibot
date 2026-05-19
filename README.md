@@ -1,8 +1,8 @@
-# vex-qwen-bot
+# vex-aibot
 
-Standalone libvex bot that creates or reuses a `qwen` user, joins
+Standalone libvex bot that creates or reuses an `llm` user, joins
 `https://vex.wtf/invite/c1990fa3-2eea-4f87-b01d-10c8171ec218`, and responds to
-`@qwen <text>` in Vex channels or DMs.
+`@llm <text>` in Vex channels or DMs.
 
 Responses come from the local OpenAI-compatible llama.cpp endpoint at
 `http://192.168.0.123:8080/v1/chat/completions` with `model: "Qwen2"`.
@@ -23,8 +23,8 @@ pnpm start
 
 ```sh
 pm2 start ecosystem.config.cjs
-pm2 logs vex-qwen-bot
-pm2 restart vex-qwen-bot
+pm2 logs vex-llm-bot
+pm2 restart vex-llm-bot
 pm2 save
 ```
 
@@ -43,4 +43,4 @@ Important environment overrides:
 - `VEX_QWEN_CONTEXT_MESSAGES`
 - `VEX_QWEN_DEBUG`
 
-Persistent bot state defaults to `~/.vex-qwen-bot`.
+Persistent bot state defaults to `~/.vex-llm-bot`.

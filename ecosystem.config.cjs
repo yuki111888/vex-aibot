@@ -1,7 +1,7 @@
 module.exports = {
     apps: [
         {
-            name: "vex-qwen-bot",
+            name: "vex-llm-bot",
             cwd: __dirname,
             script: "src/qwen-bot.js",
             interpreter: "node",
@@ -16,6 +16,8 @@ module.exports = {
                 NODE_ENV: "production",
                 VEX_QWEN_LLM_URL: "http://192.168.0.123:8080",
                 VEX_QWEN_MODEL: "Qwen2",
+                VEX_QWEN_USERNAME: "llm",
+                VEX_QWEN_DATA_DIR: `${process.env.HOME}/.vex-llm-bot`,
             },
         },
     ],

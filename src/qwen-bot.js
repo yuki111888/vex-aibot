@@ -11,8 +11,8 @@ const DEFAULT_INVITE =
     "https://vex.wtf/invite/c1990fa3-2eea-4f87-b01d-10c8171ec218";
 const DEFAULT_LLM_URL = "http://192.168.0.123:8080";
 const DEFAULT_MODEL = "Qwen2";
-const DEFAULT_USERNAME = "qwen";
-const LEGACY_COMMAND = "/qwen";
+const DEFAULT_USERNAME = "llm";
+const LEGACY_COMMANDS = ["/llm", "/qwen"];
 const MAX_REPLY_CHARS = 1800;
 const DEFAULT_SYNC_INTERVAL_MS = 5000;
 const DEFAULT_CONTEXT_MESSAGES = 24;
@@ -77,7 +77,7 @@ async function main() {
     const me = client.me.user();
     names.set(me.userID, me.username);
     console.log(
-        `qwen bot online as ${me.username} (${me.userID}); listening for @${settings.username} <text>`,
+        `${settings.username} bot online as ${me.username} (${me.userID}); listening for @${settings.username} <text>`,
     );
 
     await new Promise(() => {});
@@ -93,7 +93,7 @@ async function authenticateOrRegisterBot(settings) {
         }
         await client.close().catch(() => {});
         throw new Error(
-            `Stored qwen device login failed: ${err.message}. Delete ${settings.statePath} to create a fresh bot device, or restore the matching device on the server.`,
+            `Stored ${settings.username} device login failed: ${err.message}. Delete ${settings.statePath} to create a fresh bot device, or restore the matching device on the server.`,
         );
     }
 
@@ -172,7 +172,7 @@ async function handleMessage(client, settings, message) {
         return;
     }
 
-    const prompt = parseQwenPrompt(message.message, settings);
+    const prompt = parseBotPrompt(message.message, settings);
     if (prompt === null) {
         logDebug(
             settings,
@@ -193,9 +193,9 @@ async function handleMessage(client, settings, message) {
     );
     let output;
     try {
-        output = await completeWithQwen(client, settings, message, prompt);
+        output = await completeWithModel(client, settings, message, prompt);
     } catch (err) {
-        output = `qwen error: ${formatError(err)}`;
+        output = `${settings.username} error: ${formatError(err)}`;
     }
 
     for (const part of splitReply(output)) {
@@ -207,7 +207,7 @@ async function handleMessage(client, settings, message) {
             if (message.group) {
                 await client.messages.send(
                     message.authorID,
-                    `qwen saw your group prompt but could not answer in-channel: ${rendered}`,
+                    `${settings.username} saw your group prompt but could not answer in-channel: ${rendered}`,
                 );
             } else {
                 throw err;
@@ -216,7 +216,7 @@ async function handleMessage(client, settings, message) {
     }
 }
 
-async function completeWithQwen(client, settings, source, prompt) {
+async function completeWithModel(client, settings, source, prompt) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), settings.llmTimeoutMs);
     try {
@@ -240,7 +240,7 @@ async function completeWithQwen(client, settings, source, prompt) {
                     messages: [
                         {
                             content:
-                                "You are Qwen2 inside a Vex chat. Answer directly and keep the response useful. If recent chat context is provided, use it as memory for this conversation, but do not quote it unless helpful.",
+                                `You are ${settings.username}, an AI assistant inside a Vex chat. Answer directly and keep the response useful. If recent chat context is provided, use it as memory for this conversation, but do not quote it unless helpful.`,
                             role: "system",
                         },
                         ...(context
@@ -346,7 +346,7 @@ async function checkLlm(settings) {
         });
         if (!res.ok) {
             console.error(
-                `qwen warning: model endpoint ${settings.llmModelsUrl} returned ${res.status}`,
+                `${settings.username} warning: model endpoint ${settings.llmModelsUrl} returned ${res.status}`,
             );
             return;
         }
@@ -356,7 +356,7 @@ async function checkLlm(settings) {
         );
     } catch (err) {
         console.error(
-            `qwen warning: could not reach model endpoint ${settings.llmModelsUrl}: ${formatError(err)}`,
+            `${settings.username} warning: could not reach model endpoint ${settings.llmModelsUrl}: ${formatError(err)}`,
         );
     } finally {
         clearTimeout(timer);
@@ -368,7 +368,7 @@ function startInboxSync(client, settings) {
     const interval = setInterval(() => {
         client.syncInboxNow().catch((err) => {
             if (settings.debug) {
-                console.error(`qwen sync failed: ${formatError(err)}`);
+                console.error(`${settings.username} sync failed: ${formatError(err)}`);
             }
         });
     }, settings.syncIntervalMs);
@@ -383,11 +383,14 @@ async function reply(client, source, text) {
     }
 }
 
-function parseQwenPrompt(text, settings) {
+function parseBotPrompt(text, settings) {
     const trimmed = String(text ?? "").trim();
-    if (trimmed.toLowerCase() === LEGACY_COMMAND) return "";
-    if (trimmed.toLowerCase().startsWith(`${LEGACY_COMMAND} `)) {
-        return trimmed.slice(LEGACY_COMMAND.length).trim();
+    const lower = trimmed.toLowerCase();
+    for (const command of LEGACY_COMMANDS) {
+        if (lower === command) return "";
+        if (lower.startsWith(`${command} `)) {
+            return trimmed.slice(command.length).trim();
+        }
     }
 
     const mention = mentionRegex(settings.username);
@@ -446,11 +449,15 @@ async function resolveSettings(flags) {
         process.env.NODE_ENV = "development";
     }
 
+    const username = String(
+        flags.username ?? process.env.VEX_QWEN_USERNAME ?? DEFAULT_USERNAME,
+    ).toLowerCase();
+
     const dataDir = path.resolve(
         String(
             flags["data-dir"] ??
                 process.env.VEX_QWEN_DATA_DIR ??
-                path.join(os.homedir(), ".vex-qwen-bot"),
+                path.join(os.homedir(), `.vex-${username}-bot`),
         ),
     );
     await fs.mkdir(dataDir, { recursive: true, mode: 0o700 });
@@ -492,7 +499,7 @@ async function resolveSettings(flags) {
     return {
         client: {
             dbFolder,
-            deviceName: "vex-qwen-bot",
+            deviceName: `vex-${username}-bot`,
             host,
             unsafeHttp,
             ...(flags["dev-key"] || process.env.DEV_API_KEY
@@ -521,7 +528,7 @@ async function resolveSettings(flags) {
             flags.model ?? process.env.VEX_QWEN_MODEL ?? DEFAULT_MODEL,
         ),
         password: flags.password ?? process.env.VEX_QWEN_PASSWORD,
-        statePath: path.join(dataDir, "qwen-bot.json"),
+        statePath: path.join(dataDir, `${username}-bot.json`),
         syncIntervalMs: Number.isFinite(syncIntervalMs)
             ? syncIntervalMs
             : DEFAULT_SYNC_INTERVAL_MS,
@@ -529,9 +536,7 @@ async function resolveSettings(flags) {
             Boolean(flags.debug) ||
             process.env.VEX_QWEN_DEBUG === "1" ||
             process.env.VEX_QWEN_DEBUG === "true",
-        username: String(
-            flags.username ?? process.env.VEX_QWEN_USERNAME ?? DEFAULT_USERNAME,
-        ).toLowerCase(),
+        username,
     };
 }
 
@@ -648,7 +653,7 @@ function formatError(err) {
 
 function logDebug(settings, message) {
     if (settings.debug) {
-        console.error(`qwen debug: ${message}`);
+        console.error(`${settings.username} debug: ${message}`);
     }
 }
 
@@ -700,17 +705,17 @@ function parseArgs(argv) {
 }
 
 function printUsage() {
-    console.log(`Usage: vex-qwen-bot [options]
+    console.log(`Usage: vex-aibot [options]
 
-Creates or reuses a libvex user named qwen, redeems the configured invite, and
-responds to "@qwen <text>" with output from an OpenAI-compatible local model.
+Creates or reuses a libvex user named ${DEFAULT_USERNAME}, redeems the configured invite, and
+responds to "@${DEFAULT_USERNAME} <text>" with output from an OpenAI-compatible local model.
 
 Options:
   --invite <url-or-id>       Invite to redeem (default: ${DEFAULT_INVITE})
   --llm-url <url>            OpenAI-compatible base or chat URL (default: ${DEFAULT_LLM_URL})
   --model <id>               Model field for chat completions (default: ${DEFAULT_MODEL})
   --username <name>          Bot username (default: ${DEFAULT_USERNAME})
-  --data-dir <path>          Persistent bot state dir (default: ~/.vex-qwen-bot)
+  --data-dir <path>          Persistent bot state dir (default: ~/.vex-${DEFAULT_USERNAME}-bot)
   --api-url <url>            Vex API URL; sets host and protocol
   --host <host[:port]>       Vex API host (default: ${DEFAULT_HOST})
   --http                     Use http/ws for Vex API
