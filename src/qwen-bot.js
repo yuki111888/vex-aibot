@@ -252,7 +252,24 @@ async function completeWithModel(client, settings, source, prompt) {
             const toolCall = parseToolCall(content);
             if (!toolCall) return cleanupFinalAnswer(content);
             if (step >= settings.vexToolSteps) {
-                return `I wanted to use ${toolCall.name}, but I hit my Vex tool-call limit.`;
+                return await completeFromToolTrace(
+                    settings,
+                    headers,
+                    controller.signal,
+                    prompt,
+                    context,
+                    toolTrace,
+                );
+            }
+            if (hasToolCall(toolTrace, toolCall)) {
+                return await completeFromToolTrace(
+                    settings,
+                    headers,
+                    controller.signal,
+                    prompt,
+                    context,
+                    toolTrace,
+                );
             }
 
             const result = await runVexTool(
@@ -321,6 +338,9 @@ function buildModelPrompt(settings, prompt, context, toolTrace = []) {
                 .map(formatToolTraceEntry)
                 .join("\n\n")}`,
         );
+        parts.push(
+            "Use the Vex tool results above to answer when they are sufficient. Do not repeat an identical tool call.",
+        );
     }
     parts.push(`Current prompt:\n${prompt}`);
     return parts.join("\n\n");
@@ -348,6 +368,69 @@ Call at most one tool per response. Do not invent Vex IDs; use tools to discover
 
 function formatToolTraceEntry(entry) {
     return `Tool call: ${JSON.stringify(entry.call)}\nTool result: ${JSON.stringify(entry.result)}`;
+}
+
+async function completeFromToolTrace(
+    settings,
+    headers,
+    signal,
+    prompt,
+    context,
+    toolTrace,
+) {
+    if (toolTrace.length === 0) {
+        return "I tried to use a Vex tool, but I did not get a tool result.";
+    }
+    const finalSettings = { ...settings, vexToolSteps: 0 };
+    const userContent = `${buildModelPrompt(
+        finalSettings,
+        prompt,
+        context,
+        toolTrace,
+    )}\n\nNo more tool calls are available. Reply now in plain text using the Vex tool results.`;
+    const content = await requestChatCompletion(
+        settings,
+        headers,
+        signal,
+        userContent,
+    );
+    if (!parseToolCall(content)) return cleanupFinalAnswer(content);
+    return fallbackToolTraceAnswer(toolTrace);
+}
+
+function hasToolCall(toolTrace, toolCall) {
+    const rendered = JSON.stringify(normalizeToolCall(toolCall));
+    return toolTrace.some(
+        (entry) => JSON.stringify(normalizeToolCall(entry.call)) === rendered,
+    );
+}
+
+function normalizeToolCall(toolCall) {
+    return {
+        arguments: sortObjectKeys(toolCall.arguments ?? {}),
+        name: toolCall.name,
+    };
+}
+
+function sortObjectKeys(value) {
+    if (Array.isArray(value)) return value.map(sortObjectKeys);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(
+        Object.entries(value)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([key, child]) => [key, sortObjectKeys(child)]),
+    );
+}
+
+function fallbackToolTraceAnswer(toolTrace) {
+    const latest = toolTrace.at(-1);
+    if (latest?.call?.name === "vex.my_profile") {
+        const user = latest.result?.user;
+        if (user?.username && user?.userID) {
+            return `My Vex username is ${user.username}, and my user ID is ${user.userID}.`;
+        }
+    }
+    return `Vex tool result: ${JSON.stringify(latest?.result ?? toolTrace)}`;
 }
 
 function parseToolCall(content) {
