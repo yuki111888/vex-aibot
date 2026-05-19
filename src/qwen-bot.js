@@ -233,26 +233,12 @@ async function completeWithModel(client, settings, source, prompt) {
                 return "";
             },
         );
+        const userContent = buildModelPrompt(settings, prompt, context);
         let res;
         try {
             res = await fetch(settings.llmChatCompletionsUrl, {
                 body: JSON.stringify({
-                    messages: [
-                        {
-                            content:
-                                `You are ${settings.username}, an AI assistant inside a Vex chat. Answer directly and keep the response useful. If recent chat context is provided, use it as memory for this conversation, but do not quote it unless helpful.`,
-                            role: "system",
-                        },
-                        ...(context
-                            ? [
-                                  {
-                                      content: `Recent chat context, oldest to newest:\n${context}`,
-                                      role: "system",
-                                  },
-                              ]
-                            : []),
-                        { content: prompt, role: "user" },
-                    ],
+                    messages: [{ content: userContent, role: "user" }],
                     model: settings.model,
                     stream: false,
                 }),
@@ -285,6 +271,19 @@ async function completeWithModel(client, settings, source, prompt) {
     } finally {
         clearTimeout(timer);
     }
+}
+
+function buildModelPrompt(settings, prompt, context) {
+    const parts = [
+        `You are ${settings.username}, an AI assistant inside a Vex chat.`,
+        "Answer directly and keep the response useful.",
+        "If recent chat context is provided, use it as memory for this conversation, but do not quote it unless helpful.",
+    ];
+    if (context) {
+        parts.push(`Recent chat context, oldest to newest:\n${context}`);
+    }
+    parts.push(`Current prompt:\n${prompt}`);
+    return parts.join("\n\n");
 }
 
 async function buildChatContext(client, settings, source) {
