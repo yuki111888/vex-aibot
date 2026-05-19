@@ -4,6 +4,10 @@ Standalone libvex bot that creates or reuses an `llm` user, joins
 `https://vex.wtf/invite/c1990fa3-2eea-4f87-b01d-10c8171ec218`, and responds to
 `@llm <text>` in Vex channels or DMs.
 
+The PM2 config also runs a second `llm` bot against `dev.vex.wtf`, using
+`~/.vex-llm-bot-dev` and invite
+`https://vex.wtf/invite/a2f76971-2a43-403b-bc99-f62e7a7374b1`.
+
 Responses come from the local OpenAI-compatible llama.cpp endpoint at
 `http://192.168.0.123:8080/v1/chat/completions` with `model: "Qwen2"`.
 
@@ -34,6 +38,7 @@ pnpm start
 ```sh
 pm2 start ecosystem.config.cjs
 pm2 logs vex-llm-bot
+pm2 logs vex-llm-bot-dev
 pm2 restart vex-llm-bot
 pm2 save
 ```
