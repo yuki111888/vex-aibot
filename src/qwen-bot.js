@@ -466,7 +466,11 @@ Available tools:
 - vex.list_servers: list servers visible to this bot, with channels. Arguments: {}.
 - vex.list_channels: list channels in a server. Arguments: {"server_id":"..."}; omit server_id to use the current channel's server.
 - vex.channel_members: list users visible in a channel. Arguments: {"channel_id":"..."}; omit channel_id to use the current channel.
-- vex.recent_messages: read recent local encrypted history. Arguments: {"channel_id":"...","user_id":"...","limit":20}; omit channel_id/user_id to use the current chat.
+- vex.recent_messages: read recent decrypted local history through libvex. Arguments: {"channel_id":"...","user_id":"...","limit":20}; omit channel_id/user_id to use the current chat.
+- vex.search_messages: search decrypted local history through libvex. Arguments: {"query":"text","scope":"current|all","channel_id":"...","user_id":"...","limit":20}; omit IDs to use the current chat unless scope is all.
+- vex.local_overview: summarize libvex-readable local state: visible channels, familiar DMs, message counts, sessions, permissions, and memory entries. Arguments: {}.
+- vex.local_sessions: list sanitized local encryption-session metadata without secret keys. Arguments: {"limit":20}.
+- vex.local_memory: read this bot's rolling memory summary for the current chat or all chats. Arguments: {"scope":"current|all","limit":10}.
 - vex.lookup_user: look up a user by username or user id. Arguments: {"identifier":"..."}.
 - vex.my_profile: show the bot's current user and device ids. Arguments: {}.
 
@@ -611,6 +615,18 @@ async function runVexTool(client, settings, source, toolCall) {
         case "vex.recent_messages":
             result = await vexRecentMessages(client, source, args);
             break;
+        case "vex.search_messages":
+            result = await vexSearchMessages(client, source, args);
+            break;
+        case "vex.local_overview":
+            result = await vexLocalOverview(client, settings, source);
+            break;
+        case "vex.local_sessions":
+            result = await vexLocalSessions(client, args);
+            break;
+        case "vex.local_memory":
+            result = await vexLocalMemory(settings, source, args);
+            break;
         case "vex.lookup_user":
             result = await vexLookupUser(client, args);
             break;
@@ -626,6 +642,10 @@ async function runVexTool(client, settings, source, toolCall) {
                     "vex.list_channels",
                     "vex.channel_members",
                     "vex.recent_messages",
+                    "vex.search_messages",
+                    "vex.local_overview",
+                    "vex.local_sessions",
+                    "vex.local_memory",
                     "vex.lookup_user",
                     "vex.my_profile",
                 ],
@@ -730,6 +750,252 @@ async function vexRecentMessages(client, source, args) {
     return { messages };
 }
 
+async function vexSearchMessages(client, source, args) {
+    const query = String(args.query ?? args.q ?? "").trim().toLowerCase();
+    const limit = clampInt(args.limit, 20, 1, 50);
+    const targets = await resolveMessageSearchTargets(client, source, args);
+    const matches = [];
+    for (const target of targets.slice(0, 40)) {
+        const history =
+            target.kind === "channel"
+                ? await client.messages.retrieveGroup(target.id)
+                : await client.messages.retrieve(target.id);
+        for (const message of history) {
+            if (!message.decrypted || !message.message.trim()) continue;
+            const body = message.message.replace(/\s+/g, " ");
+            if (query && !body.toLowerCase().includes(query)) continue;
+            matches.push({
+                authorID: message.authorID,
+                group: message.group,
+                mailID: message.mailID,
+                message: truncateForContext(body),
+                target,
+                timestamp: message.timestamp,
+                username: await usernameFor(client, message.authorID),
+            });
+        }
+    }
+    matches.sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+    return {
+        matches: matches.slice(0, limit),
+        query,
+        searchedTargets: targets.length,
+    };
+}
+
+async function resolveMessageSearchTargets(client, source, args) {
+    const channelID = args.channel_id ?? args.channelID;
+    if (channelID) {
+        const channel = await client.channels.retrieveByID(String(channelID));
+        return [
+            {
+                id: String(channelID),
+                kind: "channel",
+                name: channel?.name ?? String(channelID),
+            },
+        ];
+    }
+    const userID = args.user_id ?? args.userID;
+    if (userID) {
+        return [
+            {
+                id: String(userID),
+                kind: "dm",
+                name: await usernameFor(client, String(userID)),
+            },
+        ];
+    }
+    if (String(args.scope ?? "").toLowerCase() === "all") {
+        const [bootstrap, familiars] = await Promise.all([
+            client.servers.retrieveWithChannels().catch(() => ({
+                channelsByServer: {},
+                servers: [],
+            })),
+            client.users.familiars().catch(() => []),
+        ]);
+        const serverNames = new Map(
+            bootstrap.servers.map((server) => [server.serverID, server.name]),
+        );
+        const channels = Object.values(bootstrap.channelsByServer)
+            .flat()
+            .map((channel) => ({
+                id: channel.channelID,
+                kind: "channel",
+                name: `#${channel.name}`,
+                server: serverNames.get(channel.serverID),
+            }));
+        const botID = client.me.user().userID;
+        const dms = familiars
+            .filter((user) => user.userID !== botID)
+            .map((user) => ({
+                id: user.userID,
+                kind: "dm",
+                name: user.username,
+            }));
+        return [...channels, ...dms];
+    }
+    if (source.group) {
+        const channel = await client.channels.retrieveByID(source.group);
+        return [
+            {
+                id: source.group,
+                kind: "channel",
+                name: channel?.name ? `#${channel.name}` : source.group,
+            },
+        ];
+    }
+    return [
+        {
+            id: source.authorID,
+            kind: "dm",
+            name: await usernameFor(client, source.authorID),
+        },
+    ];
+}
+
+async function vexLocalOverview(client, settings, source) {
+    const [bootstrap, familiars, sessions, permissions, memory] =
+        await Promise.all([
+            client.servers.retrieveWithChannels().catch(() => ({
+                channelsByServer: {},
+                servers: [],
+            })),
+            client.users.familiars().catch(() => []),
+            client.sessions.retrieve().catch(() => []),
+            client.permissions.retrieve().catch(() => []),
+            readMemoryStore(settings.memoryPath).catch(() => createMemoryStore()),
+        ]);
+    const channelStats = [];
+    for (const server of bootstrap.servers) {
+        for (const channel of bootstrap.channelsByServer[server.serverID] ?? []) {
+            channelStats.push({
+                channel: sanitizeChannel(channel),
+                history: await messageHistoryStats(
+                    client.messages.retrieveGroup(channel.channelID),
+                ),
+                server: sanitizeServer(server),
+            });
+        }
+    }
+    const botID = client.me.user().userID;
+    const dmStats = [];
+    for (const user of familiars.filter((item) => item.userID !== botID)) {
+        dmStats.push({
+            history: await messageHistoryStats(
+                client.messages.retrieve(user.userID),
+            ),
+            user: sanitizeUser(user),
+        });
+    }
+    return {
+        bot: sanitizeUser(client.me.user()),
+        channels: channelStats,
+        currentChatKey: chatMemoryKey(source),
+        dms: dmStats,
+        memoryEntries: Object.entries(memory.chats ?? {}).map(([key, entry]) => ({
+            key,
+            kind: entry.kind,
+            summaryChars: String(entry.summary ?? "").length,
+            updatedAt: entry.updatedAt,
+        })),
+        permissions: permissions.map(sanitizePermission),
+        sessionCount: sessions.length,
+    };
+}
+
+async function messageHistoryStats(historyPromise) {
+    const history = await historyPromise.catch(() => []);
+    const visible = history.filter(
+        (message) => message.decrypted && message.message.trim(),
+    );
+    const last = visible
+        .slice()
+        .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
+        .at(0);
+    return {
+        decryptedMessages: visible.length,
+        latest: last
+            ? {
+                  authorID: last.authorID,
+                  mailID: last.mailID,
+                  timestamp: last.timestamp,
+              }
+            : null,
+        totalMessages: history.length,
+    };
+}
+
+async function vexLocalSessions(client, args) {
+    const limit = clampInt(args.limit, 20, 1, 50);
+    const sessions = await client.sessions.retrieve();
+    sessions.sort((a, b) => String(b.lastUsed).localeCompare(String(a.lastUsed)));
+    const items = [];
+    for (const session of sessions.slice(0, limit)) {
+        items.push(await sanitizeSession(client, session));
+    }
+    return {
+        sessions: items,
+        total: sessions.length,
+    };
+}
+
+async function sanitizeSession(client, session) {
+    const userID = session.userID ?? session.userId;
+    return {
+        deviceID: session.deviceID,
+        fingerprint: session.fingerprint,
+        lastUsed: session.lastUsed,
+        mode: session.mode,
+        sessionID: session.sessionID,
+        userID,
+        username: userID
+            ? await usernameFor(client, userID).catch(() => userID)
+            : undefined,
+        verified: Boolean(session.verified),
+    };
+}
+
+async function vexLocalMemory(settings, source, args) {
+    if (!settings.memoryEnabled) return { enabled: false };
+    const store = await readMemoryStore(settings.memoryPath);
+    if (String(args.scope ?? "").toLowerCase() === "all") {
+        const limit = clampInt(args.limit, 10, 1, 50);
+        const entries = Object.entries(store.chats ?? {})
+            .sort(([, a], [, b]) =>
+                String(b.updatedAt).localeCompare(String(a.updatedAt)),
+            )
+            .slice(0, limit)
+            .map(([key, entry]) => ({
+                key,
+                kind: entry.kind,
+                lastMailID: entry.lastMailID,
+                summary: truncateText(
+                    entry.summary ?? "",
+                    settings.memorySummaryChars,
+                ),
+                updatedAt: entry.updatedAt,
+            }));
+        return { enabled: true, entries };
+    }
+    const key = chatMemoryKey(source);
+    const entry = store.chats?.[key];
+    return {
+        enabled: true,
+        key,
+        memory: entry
+            ? {
+                  kind: entry.kind,
+                  lastMailID: entry.lastMailID,
+                  summary: truncateText(
+                      entry.summary ?? "",
+                      settings.memorySummaryChars,
+                  ),
+                  updatedAt: entry.updatedAt,
+              }
+            : null,
+    };
+}
+
 async function vexLookupUser(client, args) {
     const identifier = String(args.identifier ?? args.user ?? "").trim();
     if (!identifier) return { error: "identifier is required" };
@@ -784,6 +1050,17 @@ function sanitizeUser(user) {
         lastSeen: user.lastSeen,
         userID: user.userID,
         username: user.username,
+    };
+}
+
+function sanitizePermission(permission) {
+    if (!permission) return null;
+    return {
+        permissionID: permission.permissionID,
+        powerLevel: permission.powerLevel,
+        resourceID: permission.resourceID,
+        resourceType: permission.resourceType,
+        userID: permission.userID,
     };
 }
 
