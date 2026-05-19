@@ -1,0 +1,22 @@
+{
+    "name": "vex-qwen-bot",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Standalone libvex bot that answers @qwen with a local OpenAI-compatible Qwen model.",
+    "type": "module",
+    "scripts": {
+        "start": "node src/qwen-bot.js",
+        "check": "node --check src/qwen-bot.js && node --check ecosystem.config.cjs",
+        "pm2:start": "pm2 start ecosystem.config.cjs",
+        "pm2:restart": "pm2 restart vex-qwen-bot",
+        "pm2:logs": "pm2 logs vex-qwen-bot"
+    },
+    "dependencies": {
+        "@vex-chat/libvex": "6.6.2",
+        "better-sqlite3": "11.10.0"
+    },
+    "engines": {
+        "node": ">=24.0.0"
+    },
+    "packageManager": "pnpm@10.23.0"
+}
