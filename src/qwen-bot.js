@@ -352,9 +352,11 @@ function formatToolTraceEntry(entry) {
 
 function parseToolCall(content) {
     const trimmed = String(content ?? "").trim();
-    const jsonText = trimmed.startsWith("TOOL_CALL:")
+    const withoutPrefix = trimmed.startsWith("TOOL_CALL:")
         ? trimmed.slice("TOOL_CALL:".length).trim()
         : trimmed;
+    const fenced = withoutPrefix.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    const jsonText = fenced ? fenced[1].trim() : withoutPrefix;
     if (!jsonText.startsWith("{")) return null;
     try {
         const parsed = JSON.parse(jsonText);
