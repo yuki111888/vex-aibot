@@ -11,8 +11,8 @@ const DEFAULT_INVITE =
     "https://vex.wtf/invite/c1990fa3-2eea-4f87-b01d-10c8171ec218";
 const DEFAULT_LLM_URL = "http://192.168.0.123:8080";
 const DEFAULT_MODEL = "Qwen2";
-const DEFAULT_USERNAME = "llm";
-const LEGACY_COMMANDS = ["/llm"];
+const DEFAULT_USERNAME = "bot";
+const LEGACY_COMMANDS = ["/bot"];
 const MAX_REPLY_CHARS = 1800;
 const DEFAULT_SYNC_INTERVAL_MS = 5000;
 const DEFAULT_CONTEXT_MESSAGES = 12;
@@ -22,6 +22,13 @@ const DEFAULT_VEX_TOOL_STEPS = 3;
 const MAX_CONTEXT_LINE_CHARS = 220;
 const MAX_TOOL_RESULT_CHARS = 1800;
 const MEMORY_VERSION = 1;
+const UUID_PATTERN =
+    "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const INVITE_LINK_REGEX = new RegExp(
+    `(?:vex://invite/|https?://\\S*?/invite/|\\b[a-z0-9.-]+/invite/|/invite/)(${UUID_PATTERN})`,
+    "gi",
+);
+const RAW_INVITE_REGEX = new RegExp(`^\\s*(${UUID_PATTERN})\\s*$`, "i");
 
 const names = new Map();
 let memoryUpdateQueue = Promise.resolve();
@@ -402,7 +409,7 @@ async function main() {
     const me = client.me.user();
     names.set(me.userID, me.username);
     console.log(
-        `${settings.username} bot online as ${me.username} (${me.userID}); listening for @${settings.username} <text>`,
+        `${settings.username} bot online as ${me.username} (${me.userID}); listening for @${settings.username} <text> in channels and all DM messages`,
     );
 
     await new Promise(() => {});
@@ -460,14 +467,17 @@ async function redeemInvite(client, invite) {
     const channels = await client.channels
         .retrieve(permission.resourceID)
         .catch(() => []);
-    const channelNames = channels
-        .map((channel) => `#${channel.name}`)
-        .join(", ");
+    const channelNames = channels.map((channel) => `#${channel.name}`);
     console.log(
         `joined invite ${inviteID}; server=${permission.resourceID}${
-            channelNames ? ` channels=${channelNames}` : ""
+            channelNames.length > 0 ? ` channels=${channelNames.join(", ")}` : ""
         }`,
     );
+    return {
+        channelNames,
+        inviteID,
+        serverID: permission.resourceID,
+    };
 }
 
 async function connectAndWait(client) {
@@ -497,7 +507,12 @@ async function handleMessage(client, settings, message) {
         return;
     }
 
-    const prompt = parseBotPrompt(message.message, settings);
+    const inviteResults = message.group
+        ? []
+        : await joinDmedInvites(client, message.message);
+    const prompt = message.group
+        ? parseBotPrompt(message.message, settings)
+        : parseDirectPrompt(message.message, settings);
     if (prompt === null) {
         logDebug(
             settings,
@@ -509,8 +524,22 @@ async function handleMessage(client, settings, message) {
     }
 
     if (!prompt) {
-        await reply(client, message, `Usage: @${settings.username} <text>`);
+        if (inviteResults.length > 0) {
+            await replyInviteResults(client, message, inviteResults);
+            return;
+        }
+        await reply(
+            client,
+            message,
+            message.group
+                ? `Usage: @${settings.username} <text>`
+                : `Send a message and I will respond. In channels, use @${settings.username} <text>.`,
+        );
         return;
+    }
+
+    if (inviteResults.length > 0) {
+        await replyInviteResults(client, message, inviteResults);
     }
 
     console.log(
@@ -549,6 +578,41 @@ async function handleMessage(client, settings, message) {
             },
         );
     }
+}
+
+async function joinDmedInvites(client, text) {
+    const inviteIDs = extractInviteIDs(text);
+    const results = [];
+    for (const inviteID of inviteIDs) {
+        try {
+            results.push({
+                ok: true,
+                ...(await redeemInvite(client, inviteID)),
+            });
+        } catch (err) {
+            const error = formatError(err);
+            console.error(`failed to join DM invite ${inviteID}: ${error}`);
+            results.push({ error, inviteID, ok: false });
+        }
+    }
+    return results;
+}
+
+async function replyInviteResults(client, message, results) {
+    for (const result of results) {
+        await reply(client, message, formatInviteResult(result));
+    }
+}
+
+function formatInviteResult(result) {
+    if (!result.ok) {
+        return `Could not join invite ${result.inviteID}: ${result.error}`;
+    }
+    const channels =
+        result.channelNames?.length > 0
+            ? ` Channels: ${result.channelNames.join(", ")}.`
+            : "";
+    return `Joined invite ${result.inviteID}. Server: ${result.serverID}.${channels}`;
 }
 
 async function completeWithModel(client, settings, source, prompt) {
@@ -1871,6 +1935,23 @@ async function reply(client, source, text) {
 
 function parseBotPrompt(text, settings) {
     const trimmed = String(text ?? "").trim();
+    const commandPrompt = parseCommandPrompt(trimmed);
+    if (commandPrompt !== null) return commandPrompt;
+
+    const mention = mentionRegex(settings.username);
+    if (!mention.test(trimmed)) return null;
+    return stripMentions(trimmed, settings);
+}
+
+function parseDirectPrompt(text, settings) {
+    const trimmed = stripInviteText(text);
+    const commandPrompt = parseCommandPrompt(trimmed);
+    if (commandPrompt !== null) return commandPrompt;
+    return stripMentions(trimmed, settings);
+}
+
+function parseCommandPrompt(text) {
+    const trimmed = String(text ?? "").trim();
     const lower = trimmed.toLowerCase();
     for (const command of LEGACY_COMMANDS) {
         if (lower === command) return "";
@@ -1878,10 +1959,37 @@ function parseBotPrompt(text, settings) {
             return trimmed.slice(command.length).trim();
         }
     }
+    return null;
+}
 
-    const mention = mentionRegex(settings.username);
-    if (!mention.test(trimmed)) return null;
-    return trimmed.replace(mentionRegex(settings.username, "gi"), " ").trim();
+function stripMentions(text, settings) {
+    return String(text ?? "")
+        .replace(mentionRegex(settings.username, "gi"), " ")
+        .trim();
+}
+
+function extractInviteIDs(text) {
+    const ids = new Set();
+    const value = String(text ?? "");
+    INVITE_LINK_REGEX.lastIndex = 0;
+    for (const match of value.matchAll(INVITE_LINK_REGEX)) {
+        ids.add(match[1].toLowerCase());
+    }
+    INVITE_LINK_REGEX.lastIndex = 0;
+    const raw = value.match(RAW_INVITE_REGEX);
+    if (raw?.[1]) ids.add(raw[1].toLowerCase());
+    return [...ids];
+}
+
+function stripInviteText(text) {
+    INVITE_LINK_REGEX.lastIndex = 0;
+    const stripped = String(text ?? "")
+        .replace(INVITE_LINK_REGEX, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    INVITE_LINK_REGEX.lastIndex = 0;
+    if (RAW_INVITE_REGEX.test(stripped)) return "";
+    return /[A-Za-z0-9]/.test(stripped) ? stripped : "";
 }
 
 function mentionRegex(username, flags = "i") {
@@ -1943,7 +2051,7 @@ async function resolveSettings(flags) {
         String(
             flags["data-dir"] ??
                 process.env.VEX_QWEN_DATA_DIR ??
-                path.join(os.homedir(), `.vex-${username}-bot`),
+                path.join(os.homedir(), `.vex-${username}`),
         ),
     );
     await fs.mkdir(dataDir, { recursive: true, mode: 0o700 });
@@ -2232,15 +2340,15 @@ function parseArgs(argv) {
 function printUsage() {
     console.log(`Usage: vex-aibot [options]
 
-Creates or reuses a libvex user named ${DEFAULT_USERNAME}, redeems the configured invite, and
-responds to "@${DEFAULT_USERNAME} <text>" with output from an OpenAI-compatible local model.
+Creates or reuses a libvex user named ${DEFAULT_USERNAME}, redeems the configured invite,
+responds to "@${DEFAULT_USERNAME} <text>" in channels, and responds to every DM message.
 
 Options:
   --invite <url-or-id>       Invite to redeem (default: ${DEFAULT_INVITE})
   --llm-url <url>            OpenAI-compatible base or chat URL (default: ${DEFAULT_LLM_URL})
   --model <id>               Model field for chat completions (default: ${DEFAULT_MODEL})
   --username <name>          Bot username (default: ${DEFAULT_USERNAME})
-  --data-dir <path>          Persistent bot state dir (default: ~/.vex-${DEFAULT_USERNAME}-bot)
+  --data-dir <path>          Persistent bot state dir (default: ~/.vex-${DEFAULT_USERNAME})
   --api-url <url>            Vex API URL; sets host and protocol
   --host <host[:port]>       Vex API host (default: ${DEFAULT_HOST})
   --http                     Use http/ws for Vex API

@@ -1,11 +1,15 @@
 # vex-aibot
 
-Standalone libvex bot that creates or reuses an `llm` user, joins
+Standalone libvex bot that creates or reuses a `bot` user, joins
 `https://vex.wtf/invite/c1990fa3-2eea-4f87-b01d-10c8171ec218`, and responds to
-`@llm <text>` in Vex channels or DMs.
+`@bot <text>` in Vex channels. In DMs, every non-empty message is treated as a
+prompt.
 
-The PM2 config also runs a second `llm` bot against `dev.vex.wtf`, using
-`~/.vex-llm-bot-dev` and invite
+If the bot receives a Vex server invite in a DM, it redeems that invite and joins
+the server.
+
+The PM2 config also runs a second `bot` process against `dev.vex.wtf`, using
+`~/.vex-bot-dev` and invite
 `https://vex.wtf/invite/a2f76971-2a43-403b-bc99-f62e7a7374b1`.
 
 Responses come from the local OpenAI-compatible llama.cpp endpoint at
@@ -40,9 +44,9 @@ pnpm start
 
 ```sh
 pm2 start ecosystem.config.cjs
-pm2 logs vex-llm-bot
-pm2 logs vex-llm-bot-dev
-pm2 restart vex-llm-bot
+pm2 logs vex-bot
+pm2 logs vex-bot-dev
+pm2 restart vex-bot
 pm2 save
 ```
 
@@ -65,5 +69,5 @@ Important environment overrides:
 - `VEX_QWEN_TOOL_STEPS`
 - `VEX_QWEN_DEBUG`
 
-Persistent bot state defaults to `~/.vex-llm-bot`; rolling memory is stored in
-`~/.vex-llm-bot/llm-memory.json`.
+Persistent bot state defaults to `~/.vex-bot`; rolling memory is stored in
+`~/.vex-bot/bot-memory.json`.

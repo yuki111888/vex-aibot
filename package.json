@@ -2,14 +2,14 @@
     "name": "vex-aibot",
     "version": "0.1.0",
     "private": true,
-    "description": "Standalone libvex bot that answers @llm with a local OpenAI-compatible model.",
+    "description": "Standalone libvex bot that answers @bot and DMs with a local OpenAI-compatible model.",
     "type": "module",
     "scripts": {
         "start": "node src/qwen-bot.js",
         "check": "node --check src/qwen-bot.js && node --check ecosystem.config.cjs",
         "pm2:start": "pm2 start ecosystem.config.cjs",
-        "pm2:restart": "pm2 restart vex-llm-bot",
-        "pm2:logs": "pm2 logs vex-llm-bot"
+        "pm2:restart": "pm2 restart vex-bot",
+        "pm2:logs": "pm2 logs vex-bot"
     },
     "dependencies": {
         "@vex-chat/libvex": "6.6.2",
