@@ -17,6 +17,8 @@ function botApp({ dataDir, host, invite, name }) {
             VEX_QWEN_MODEL: "Qwen2",
             VEX_QWEN_USERNAME: "bot",
             VEX_QWEN_DATA_DIR: dataDir,
+            VEX_QWEN_WHISPER_COMMAND: `${process.env.HOME}/whisper.cpp/build/bin/whisper-cli`,
+            VEX_QWEN_WHISPER_MODEL: `${process.env.HOME}/whisper.cpp/models/ggml-base.en.bin`,
             ...(host ? { VEX_CHAT_HOST: host } : {}),
             ...(invite ? { VEX_QWEN_INVITE: invite } : {}),
         },

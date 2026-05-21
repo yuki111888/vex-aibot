@@ -8,6 +8,10 @@ prompt.
 If the bot receives a Vex server invite in a DM, it redeems that invite and joins
 the server.
 
+If a Vex audio attachment is posted, the bot downloads it with libvex,
+transcribes it through local whisper.cpp, and posts the transcript back to the
+same DM or channel.
+
 The PM2 config also runs a second `bot` process against `dev.vex.wtf`, using
 `~/.vex-bot-dev` and invite
 `https://vex.wtf/invite/a2f76971-2a43-403b-bc99-f62e7a7374b1`.
@@ -67,6 +71,8 @@ Important environment overrides:
 - `VEX_QWEN_MEMORY` (`0` disables rolling summaries)
 - `VEX_QWEN_MEMORY_SUMMARY_CHARS`
 - `VEX_QWEN_TOOL_STEPS`
+- `VEX_QWEN_WHISPER_COMMAND`
+- `VEX_QWEN_WHISPER_MODEL`
 - `VEX_QWEN_DEBUG`
 
 Persistent bot state defaults to `~/.vex-bot`; rolling memory is stored in

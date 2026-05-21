@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
 import { Client, DeviceApprovalRequiredError } from "@vex-chat/libvex";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import ffmpegStatic from "ffmpeg-static";
 
 const DEFAULT_HOST = "api.vex.wtf";
 const LOCAL_HOST = "127.0.0.1:16777";
@@ -19,9 +21,12 @@ const DEFAULT_CONTEXT_MESSAGES = 12;
 const DEFAULT_CONTEXT_CHARS = 1600;
 const DEFAULT_MEMORY_SUMMARY_CHARS = 1200;
 const DEFAULT_VEX_TOOL_STEPS = 3;
+const DEFAULT_STT_TIMEOUT_MS = 120000;
+const DEFAULT_STT_MAX_BYTES = 25 * 1024 * 1024;
 const MAX_CONTEXT_LINE_CHARS = 220;
 const MAX_TOOL_RESULT_CHARS = 1800;
 const MEMORY_VERSION = 1;
+const VEX_FILE_SCHEME = "vex-file://";
 const UUID_PATTERN =
     "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const INVITE_LINK_REGEX = new RegExp(
@@ -29,6 +34,20 @@ const INVITE_LINK_REGEX = new RegExp(
     "gi",
 );
 const RAW_INVITE_REGEX = new RegExp(`^\\s*(${UUID_PATTERN})\\s*$`, "i");
+const VEX_FILE_MARKDOWN_REGEX =
+    /!?\[(?<label>[^\]\n]*)\]\((?<url>vex-file:\/\/[^)\s]+)\)/gi;
+const AUDIO_EXTENSIONS = new Set([
+    ".aac",
+    ".aiff",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".oga",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".webm",
+]);
 
 const names = new Map();
 let memoryUpdateQueue = Promise.resolve();
@@ -507,12 +526,18 @@ async function handleMessage(client, settings, message) {
         return;
     }
 
+    const voiceResults = await transcribeVoiceMemos(client, settings, message);
+    const promptText = stripVexFileMarkdown(message.message);
+    if (voiceResults.length > 0) {
+        await replyVoiceTranscripts(client, message, voiceResults);
+    }
+
     const inviteResults = message.group
         ? []
-        : await joinDmedInvites(client, message.message);
+        : await joinDmedInvites(client, promptText);
     const prompt = message.group
-        ? parseBotPrompt(message.message, settings)
-        : parseDirectPrompt(message.message, settings);
+        ? parseBotPrompt(promptText, settings)
+        : parseDirectPrompt(promptText, settings);
     if (prompt === null) {
         logDebug(
             settings,
@@ -528,6 +553,7 @@ async function handleMessage(client, settings, message) {
             await replyInviteResults(client, message, inviteResults);
             return;
         }
+        if (voiceResults.length > 0) return;
         await reply(
             client,
             message,
@@ -578,6 +604,316 @@ async function handleMessage(client, settings, message) {
             },
         );
     }
+}
+
+async function transcribeVoiceMemos(client, settings, message) {
+    const attachments = parseVexFileAttachments(message.message).filter(
+        isAudioAttachment,
+    );
+    if (attachments.length === 0) return [];
+    if (!settings.sttEnabled) {
+        logDebug(
+            settings,
+            `ignored ${attachments.length} audio attachment(s); STT is not configured`,
+        );
+        return [];
+    }
+
+    const results = [];
+    for (const attachment of attachments) {
+        try {
+            if (
+                attachment.fileSize > 0 &&
+                attachment.fileSize > settings.sttMaxBytes
+            ) {
+                throw new Error(
+                    `audio file is ${formatBytes(attachment.fileSize)}, max is ${formatBytes(settings.sttMaxBytes)}`,
+                );
+            }
+            const file = await client.files.retrieve(
+                attachment.fileID,
+                attachment.key,
+            );
+            if (!file) throw new Error("file not found");
+            if (file.data.byteLength > settings.sttMaxBytes) {
+                throw new Error(
+                    `audio file is ${formatBytes(file.data.byteLength)}, max is ${formatBytes(settings.sttMaxBytes)}`,
+                );
+            }
+            const transcript = await transcribeAudio(settings, attachment, file.data);
+            results.push({ attachment, ok: true, transcript });
+        } catch (err) {
+            const error = formatError(err);
+            console.error(
+                `voice memo transcription failed for ${attachment.fileID}: ${error}`,
+            );
+            results.push({ attachment, error, ok: false });
+        }
+    }
+    return results;
+}
+
+async function replyVoiceTranscripts(client, message, results) {
+    for (const result of results) {
+        await reply(client, message, formatVoiceTranscript(result));
+    }
+}
+
+function formatVoiceTranscript(result) {
+    const name = result.attachment.fileName || "voice memo";
+    if (!result.ok) {
+        return `Could not transcribe ${name}: ${result.error}`;
+    }
+    return `Voice memo transcript (${name}):\n${result.transcript}`;
+}
+
+async function transcribeAudio(settings, attachment, data) {
+    if (settings.sttUrl) {
+        return transcribeAudioWithOpenAiApi(settings, attachment, data);
+    }
+    return transcribeAudioWithWhisperCli(settings, attachment, data);
+}
+
+async function transcribeAudioWithOpenAiApi(settings, attachment, data) {
+    const form = new FormData();
+    form.set(
+        "file",
+        new Blob([Buffer.from(data)], {
+            type: attachment.contentType || "application/octet-stream",
+        }),
+        attachment.fileName || "voice-memo",
+    );
+    form.set("model", settings.sttModel || "whisper-1");
+    if (settings.sttLanguage) form.set("language", settings.sttLanguage);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), settings.sttTimeoutMs);
+    try {
+        const headers = {};
+        if (settings.sttApiKey) headers.Authorization = `Bearer ${settings.sttApiKey}`;
+        const res = await fetch(settings.sttUrl, {
+            body: form,
+            headers,
+            method: "POST",
+            signal: controller.signal,
+        });
+        const body = await res.text();
+        if (!res.ok) {
+            throw new Error(
+                `STT request failed with ${res.status}: ${body.slice(0, 500)}`,
+            );
+        }
+        return parseSttResponse(body);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function transcribeAudioWithWhisperCli(settings, attachment, data) {
+    if (!settings.sttWhisperCommand) {
+        throw new Error("VEX_QWEN_WHISPER_COMMAND is not configured");
+    }
+    if (!settings.sttWhisperModel) {
+        throw new Error("VEX_QWEN_WHISPER_MODEL is not configured");
+    }
+
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vex-voice-"));
+    try {
+        const inputPath = path.join(
+            tempDir,
+            `input${audioExtension(attachment)}`,
+        );
+        const wavPath = path.join(tempDir, "input.wav");
+        const outputBase = path.join(tempDir, "transcript");
+        await fs.writeFile(inputPath, Buffer.from(data), { mode: 0o600 });
+        await convertAudioToWav(settings, inputPath, wavPath);
+        const args = [
+            "-m",
+            settings.sttWhisperModel,
+            "-f",
+            wavPath,
+            "-nt",
+            "-otxt",
+            "-of",
+            outputBase,
+        ];
+        if (settings.sttLanguage) {
+            args.push("-l", settings.sttLanguage);
+        }
+        const result = await runProcess(settings.sttWhisperCommand, args, {
+            timeoutMs: settings.sttTimeoutMs,
+        });
+        const transcript = await fs
+            .readFile(`${outputBase}.txt`, "utf8")
+            .catch(() => result.stdout);
+        return cleanupTranscript(transcript);
+    } finally {
+        await fs.rm(tempDir, { force: true, recursive: true }).catch(() => {});
+    }
+}
+
+async function convertAudioToWav(settings, inputPath, wavPath) {
+    const ffmpeg = settings.ffmpegPath || "ffmpeg";
+    await runProcess(
+        ffmpeg,
+        [
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            inputPath,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            wavPath,
+        ],
+        { timeoutMs: settings.sttTimeoutMs },
+    );
+}
+
+async function runProcess(command, args, { timeoutMs }) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(command, args, {
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        const timer = setTimeout(() => {
+            child.kill("SIGTERM");
+            reject(new Error(`${path.basename(command)} timed out`));
+        }, timeoutMs);
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout.on("data", (chunk) => {
+            stdout = appendOutput(stdout, chunk);
+        });
+        child.stderr.on("data", (chunk) => {
+            stderr = appendOutput(stderr, chunk);
+        });
+        child.on("error", (err) => {
+            clearTimeout(timer);
+            reject(err);
+        });
+        child.on("close", (code) => {
+            clearTimeout(timer);
+            if (code === 0) {
+                resolve({ stderr, stdout });
+                return;
+            }
+            reject(
+                new Error(
+                    `${path.basename(command)} exited ${code}: ${stderr || stdout}`,
+                ),
+            );
+        });
+    });
+}
+
+function appendOutput(current, chunk) {
+    return `${current}${String(chunk)}`.slice(-8000);
+}
+
+function parseSttResponse(body) {
+    try {
+        const parsed = JSON.parse(body);
+        if (typeof parsed.text === "string") {
+            return cleanupTranscript(parsed.text);
+        }
+    } catch {
+        // Plain-text STT responses are acceptable.
+    }
+    return cleanupTranscript(body);
+}
+
+function cleanupTranscript(text) {
+    const transcript = String(text ?? "")
+        .split("\n")
+        .map((line) => line.replace(/^\s*\[[^\]]+\]\s*/u, "").trim())
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+    if (!transcript) throw new Error("empty transcript");
+    return transcript;
+}
+
+function parseVexFileAttachments(text) {
+    const attachments = [];
+    const value = String(text ?? "");
+    VEX_FILE_MARKDOWN_REGEX.lastIndex = 0;
+    for (const match of value.matchAll(VEX_FILE_MARKDOWN_REGEX)) {
+        const attachment = parseVexFileUrl(match.groups?.url ?? "");
+        if (attachment) attachments.push(attachment);
+    }
+    VEX_FILE_MARKDOWN_REGEX.lastIndex = 0;
+    return attachments;
+}
+
+function parseVexFileUrl(url) {
+    if (!url.startsWith(VEX_FILE_SCHEME)) return null;
+    const rest = url.slice(VEX_FILE_SCHEME.length);
+    const queryStart = rest.indexOf("?");
+    const encodedFileID = queryStart === -1 ? rest : rest.slice(0, queryStart);
+    const query = queryStart === -1 ? "" : rest.slice(queryStart + 1);
+    let fileID;
+    try {
+        fileID = decodeURIComponent(encodedFileID).trim();
+    } catch {
+        return null;
+    }
+    const params = new URLSearchParams(query);
+    const key = params.get("key")?.trim() ?? "";
+    const fileName = params.get("name")?.trim() ?? "";
+    const contentType =
+        params.get("type")?.trim() || "application/octet-stream";
+    const rawSize = Number(params.get("size") ?? "0");
+    const fileSize =
+        Number.isFinite(rawSize) && rawSize >= 0 ? Math.round(rawSize) : 0;
+    if (!fileID || !key || !fileName) return null;
+    return {
+        contentType,
+        fileID,
+        fileName,
+        fileSize,
+        key,
+    };
+}
+
+function stripVexFileMarkdown(text) {
+    VEX_FILE_MARKDOWN_REGEX.lastIndex = 0;
+    const stripped = String(text ?? "")
+        .replace(VEX_FILE_MARKDOWN_REGEX, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    VEX_FILE_MARKDOWN_REGEX.lastIndex = 0;
+    return stripped;
+}
+
+function isAudioAttachment(attachment) {
+    const contentType = String(attachment.contentType ?? "").toLowerCase();
+    if (contentType.startsWith("audio/")) return true;
+    if (contentType === "video/webm" || contentType === "video/mp4") {
+        return true;
+    }
+    return AUDIO_EXTENSIONS.has(path.extname(attachment.fileName).toLowerCase());
+}
+
+function audioExtension(attachment) {
+    const ext = path.extname(attachment.fileName).toLowerCase();
+    if (AUDIO_EXTENSIONS.has(ext)) return ext;
+    if (attachment.contentType === "video/webm") return ".webm";
+    if (attachment.contentType === "video/mp4") return ".mp4";
+    return ".audio";
+}
+
+function formatBytes(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 async function joinDmedInvites(client, text) {
@@ -2112,7 +2448,33 @@ async function resolveSettings(flags) {
         ),
         10,
     );
+    const sttTimeoutMs = Number.parseInt(
+        String(
+            flags["stt-timeout-ms"] ??
+                process.env.VEX_QWEN_STT_TIMEOUT_MS ??
+                DEFAULT_STT_TIMEOUT_MS,
+        ),
+        10,
+    );
+    const sttMaxBytes = Number.parseInt(
+        String(
+            flags["stt-max-bytes"] ??
+                process.env.VEX_QWEN_STT_MAX_BYTES ??
+                DEFAULT_STT_MAX_BYTES,
+        ),
+        10,
+    );
     const llmChatCompletionsUrl = normalizeChatCompletionsUrl(llmUrl);
+    const sttUrl = flags["stt-url"] ?? process.env.VEX_QWEN_STT_URL;
+    const sttWhisperCommand =
+        flags["whisper-command"] ?? process.env.VEX_QWEN_WHISPER_COMMAND;
+    const sttWhisperModel =
+        flags["whisper-model"] ?? process.env.VEX_QWEN_WHISPER_MODEL;
+    const sttDisabled =
+        Boolean(flags["no-stt"]) ||
+        ["0", "false", "no", "off"].includes(
+            String(process.env.VEX_QWEN_STT ?? "1").toLowerCase(),
+        );
 
     return {
         client: {
@@ -2159,9 +2521,33 @@ async function resolveSettings(flags) {
         ),
         password: flags.password ?? process.env.VEX_QWEN_PASSWORD,
         statePath: path.join(dataDir, `${username}-bot.json`),
+        ffmpegPath:
+            flags["ffmpeg-path"] ??
+            process.env.VEX_QWEN_FFMPEG_PATH ??
+            ffmpegStatic ??
+            "ffmpeg",
         syncIntervalMs: Number.isFinite(syncIntervalMs)
             ? syncIntervalMs
             : DEFAULT_SYNC_INTERVAL_MS,
+        sttApiKey:
+            flags["stt-api-key"] ??
+            process.env.VEX_QWEN_STT_API_KEY ??
+            process.env.OPENAI_API_KEY,
+        sttEnabled: !sttDisabled && Boolean(sttUrl || sttWhisperCommand),
+        sttLanguage: flags["stt-language"] ?? process.env.VEX_QWEN_STT_LANGUAGE,
+        sttMaxBytes: Number.isFinite(sttMaxBytes)
+            ? Math.max(1, sttMaxBytes)
+            : DEFAULT_STT_MAX_BYTES,
+        sttModel:
+            flags["stt-model"] ??
+            process.env.VEX_QWEN_STT_MODEL ??
+            "whisper-1",
+        sttTimeoutMs: Number.isFinite(sttTimeoutMs)
+            ? sttTimeoutMs
+            : DEFAULT_STT_TIMEOUT_MS,
+        sttUrl: sttUrl ? String(sttUrl) : "",
+        sttWhisperCommand: sttWhisperCommand ? String(sttWhisperCommand) : "",
+        sttWhisperModel: sttWhisperModel ? String(sttWhisperModel) : "",
         debug:
             Boolean(flags.debug) ||
             process.env.VEX_QWEN_DEBUG === "1" ||
@@ -2326,7 +2712,11 @@ function parseArgs(argv) {
             continue;
         }
         const key = arg.slice(2);
-        if (["debug", "help", "http", "local", "no-memory"].includes(key)) {
+        if (
+            ["debug", "help", "http", "local", "no-memory", "no-stt"].includes(
+                key,
+            )
+        ) {
             flags[key] = true;
             continue;
         }
@@ -2360,6 +2750,15 @@ Options:
   --memory-summary-chars <n> Rolling per-chat summary budget (default: ${DEFAULT_MEMORY_SUMMARY_CHARS})
   --no-memory                Disable rolling per-chat memory summaries
   --vex-tool-steps <n>       Read-only Vex tool calls allowed per prompt (default: ${DEFAULT_VEX_TOOL_STEPS})
+  --stt-url <url>            OpenAI-compatible audio transcription URL
+  --stt-model <id>           Model field for STT API requests (default: whisper-1)
+  --whisper-command <path>   whisper.cpp CLI path for local voice memo STT
+  --whisper-model <path>     whisper.cpp GGML model path for local voice memo STT
+  --ffmpeg-path <path>       ffmpeg path for audio conversion
+  --stt-language <lang>      Optional STT language code
+  --stt-timeout-ms <ms>      Voice memo transcription timeout (default: ${DEFAULT_STT_TIMEOUT_MS})
+  --stt-max-bytes <n>        Max voice memo bytes to transcribe (default: ${DEFAULT_STT_MAX_BYTES})
+  --no-stt                   Disable voice memo transcription
   --llm-timeout-ms <ms>      LLM request timeout (default: 120000)
   --sync-interval-ms <ms>    Poll inbox in addition to websocket notify (default: ${DEFAULT_SYNC_INTERVAL_MS})
   --debug                    Log ignored messages, sync, and context activity
@@ -2370,5 +2769,8 @@ Environment equivalents:
   VEX_QWEN_USERNAME, VEX_QWEN_PASSWORD, VEX_QWEN_LLM_API_KEY,
   VEX_QWEN_CONTEXT_MESSAGES, VEX_QWEN_CONTEXT_CHARS, VEX_QWEN_MEMORY,
   VEX_QWEN_MEMORY_SUMMARY_CHARS, VEX_QWEN_TOOL_STEPS,
+  VEX_QWEN_STT_URL, VEX_QWEN_STT_MODEL, VEX_QWEN_STT_API_KEY,
+  VEX_QWEN_WHISPER_COMMAND, VEX_QWEN_WHISPER_MODEL, VEX_QWEN_FFMPEG_PATH,
+  VEX_QWEN_STT_LANGUAGE, VEX_QWEN_STT_TIMEOUT_MS, VEX_QWEN_STT_MAX_BYTES,
   VEX_QWEN_SYNC_INTERVAL_MS, VEX_QWEN_DEBUG`);
 }
