@@ -32,6 +32,10 @@ The bot keeps a compact rolling memory summary per DM or channel. Prompts use
 that summary plus the freshest raw messages, and the summary is rewritten after
 successful replies so long chats stay under the local model's context limit.
 
+When the bot accepts a prompt, it sends an encrypted reaction metadata event
+against the triggering message before calling the model. Set
+`VEX_QWEN_THINKING_REACTION=0` to disable it.
+
 ## Setup
 
 ```sh
@@ -71,6 +75,7 @@ Important environment overrides:
 - `VEX_QWEN_MEMORY` (`0` disables rolling summaries)
 - `VEX_QWEN_MEMORY_SUMMARY_CHARS`
 - `VEX_QWEN_TOOL_STEPS`
+- `VEX_QWEN_THINKING_REACTION` (`0` disables the prompt acknowledgement)
 - `VEX_QWEN_WHISPER_COMMAND`
 - `VEX_QWEN_WHISPER_MODEL`
 - `VEX_QWEN_DEBUG`

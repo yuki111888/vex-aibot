@@ -14,6 +14,7 @@ const DEFAULT_INVITE =
 const DEFAULT_LLM_URL = "http://192.168.0.123:8080";
 const DEFAULT_MODEL = "Qwen2";
 const DEFAULT_USERNAME = "bot";
+const DEFAULT_THINKING_REACTION = "\u{1F44D}";
 const LEGACY_COMMANDS = ["/bot"];
 const MAX_REPLY_CHARS = 1800;
 const DEFAULT_SYNC_INTERVAL_MS = 5000;
@@ -567,6 +568,8 @@ async function handleMessage(client, settings, message) {
     if (inviteResults.length > 0) {
         await replyInviteResults(client, message, inviteResults);
     }
+
+    await acknowledgeThinking(client, settings, message);
 
     console.log(
         `prompt from ${message.authorID}${message.group ? ` in ${message.group}` : ""}: ${prompt}`,
@@ -2269,6 +2272,30 @@ async function reply(client, source, text) {
     }
 }
 
+async function acknowledgeThinking(client, settings, source) {
+    if (!settings.thinkingReaction || !source.mailID) return;
+    const extra = JSON.stringify({
+        reactionEvent: {
+            action: "toggle",
+            emoji: { kind: "unicode", value: settings.thinkingReaction },
+            targetMailID: source.mailID,
+        },
+        version: 1,
+    });
+    try {
+        if (source.group) {
+            await client.messages.group(source.group, "", { extra });
+        } else {
+            await client.messages.send(source.authorID, "", { extra });
+        }
+    } catch (err) {
+        logDebug(
+            settings,
+            `thinking reaction failed for ${source.mailID}: ${formatError(err)}`,
+        );
+    }
+}
+
 function parseBotPrompt(text, settings) {
     const trimmed = String(text ?? "").trim();
     const commandPrompt = parseCommandPrompt(trimmed);
@@ -2548,6 +2575,9 @@ async function resolveSettings(flags) {
         sttUrl: sttUrl ? String(sttUrl) : "",
         sttWhisperCommand: sttWhisperCommand ? String(sttWhisperCommand) : "",
         sttWhisperModel: sttWhisperModel ? String(sttWhisperModel) : "",
+        thinkingReaction: normalizeThinkingReaction(
+            process.env.VEX_QWEN_THINKING_REACTION,
+        ),
         debug:
             Boolean(flags.debug) ||
             process.env.VEX_QWEN_DEBUG === "1" ||
@@ -2699,6 +2729,14 @@ function isLocalHost(host) {
     return h === "127.0.0.1" || h === "localhost" || h === "::1";
 }
 
+function normalizeThinkingReaction(raw) {
+    const value = String(raw ?? DEFAULT_THINKING_REACTION).trim();
+    if (["", "0", "false", "no", "off"].includes(value.toLowerCase())) {
+        return "";
+    }
+    return value;
+}
+
 function parseArgs(argv) {
     const flags = {};
     const positionals = [];
@@ -2769,6 +2807,7 @@ Environment equivalents:
   VEX_QWEN_USERNAME, VEX_QWEN_PASSWORD, VEX_QWEN_LLM_API_KEY,
   VEX_QWEN_CONTEXT_MESSAGES, VEX_QWEN_CONTEXT_CHARS, VEX_QWEN_MEMORY,
   VEX_QWEN_MEMORY_SUMMARY_CHARS, VEX_QWEN_TOOL_STEPS,
+  VEX_QWEN_THINKING_REACTION,
   VEX_QWEN_STT_URL, VEX_QWEN_STT_MODEL, VEX_QWEN_STT_API_KEY,
   VEX_QWEN_WHISPER_COMMAND, VEX_QWEN_WHISPER_MODEL, VEX_QWEN_FFMPEG_PATH,
   VEX_QWEN_STT_LANGUAGE, VEX_QWEN_STT_TIMEOUT_MS, VEX_QWEN_STT_MAX_BYTES,
