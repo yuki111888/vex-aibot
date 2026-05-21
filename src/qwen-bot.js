@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 
-import { Client, DeviceApprovalRequiredError } from "@vex-chat/libvex";
+import {
+    Client,
+    DeviceApprovalRequiredError,
+    serializeMessageExtra,
+} from "@vex-chat/libvex";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -658,16 +662,46 @@ async function transcribeVoiceMemos(client, settings, message) {
 
 async function replyVoiceTranscripts(client, message, results) {
     for (const result of results) {
-        await reply(client, message, formatVoiceTranscript(result));
+        const transcript = formatVoiceTranscript(result);
+        await reply(client, message, transcript.text, { extra: transcript.extra });
     }
 }
 
 function formatVoiceTranscript(result) {
     const name = result.attachment.fileName || "voice memo";
     if (!result.ok) {
-        return `Could not transcribe ${name}: ${result.error}`;
+        const text = `Could not transcribe ${name}: ${result.error}`;
+        return {
+            extra: serializeMessageExtra({
+                embed: {
+                    blocks: [{ source: "message", type: "markdown" }],
+                    display: "replace",
+                    kind: "voice.transcript",
+                    subtitle: name,
+                    title: "Voice memo transcription failed",
+                    tone: "danger",
+                    version: 1,
+                },
+                version: 1,
+            }),
+            text,
+        };
     }
-    return `Voice memo transcript (${name}):\n${result.transcript}`;
+    return {
+        extra: serializeMessageExtra({
+            embed: {
+                blocks: [{ source: "message", type: "markdown" }],
+                display: "replace",
+                kind: "voice.transcript",
+                subtitle: name,
+                title: "Voice memo transcript",
+                tone: "info",
+                version: 1,
+            },
+            version: 1,
+        }),
+        text: result.transcript,
+    };
 }
 
 async function transcribeAudio(settings, attachment, data) {
@@ -2264,17 +2298,17 @@ function startInboxSync(client, settings) {
     interval.unref?.();
 }
 
-async function reply(client, source, text) {
+async function reply(client, source, text, options) {
     if (source.group) {
-        await client.messages.group(source.group, text);
+        await client.messages.group(source.group, text, options);
     } else {
-        await client.messages.send(source.authorID, text);
+        await client.messages.send(source.authorID, text, options);
     }
 }
 
 async function acknowledgeThinking(client, settings, source) {
     if (!settings.thinkingReaction || !source.mailID) return;
-    const extra = JSON.stringify({
+    const extra = serializeMessageExtra({
         reactionEvent: {
             action: "toggle",
             emoji: { kind: "unicode", value: settings.thinkingReaction },

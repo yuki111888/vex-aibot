@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@vex-chat/libvex':
-        specifier: 6.7.0
-        version: 6.7.0(better-sqlite3@11.10.0)
+        specifier: 6.8.0
+        version: 6.8.0(better-sqlite3@11.10.0)
       better-sqlite3:
         specifier: 11.10.0
         version: 11.10.0
@@ -88,8 +88,8 @@ packages:
       typescript:
         optional: true
 
-  '@vex-chat/libvex@6.7.0':
-    resolution: {integrity: sha512-gVZQWtAxi/fuGrfH2RlOnx23/HUgHti/501aDG58gXOApyIeENebOVHTwQUuRlk7nAxSBjmVjYtUe7JHkOkbMg==}
+  '@vex-chat/libvex@6.8.0':
+    resolution: {integrity: sha512-Vqdzels3GGIuWUiSXVaeDtbWTfdu8iSjyzbAoAMxetArJPcJ4in0CGOxiVouhu1u6wtaY5hEPO2hNk+U+CpepQ==}
     engines: {node: '>=24.0.0'}
     peerDependencies:
       better-sqlite3: '>=11.0.0'
@@ -371,7 +371,7 @@ snapshots:
       tweetnacl: 1.0.3
       zod: 4.4.3
 
-  '@vex-chat/libvex@6.7.0(better-sqlite3@11.10.0)':
+  '@vex-chat/libvex@6.8.0(better-sqlite3@11.10.0)':
     dependencies:
       '@vex-chat/crypto': 6.0.0(@vex-chat/types@3.3.1)
       '@vex-chat/types': 3.3.1
